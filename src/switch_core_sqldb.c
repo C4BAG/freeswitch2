@@ -648,8 +648,20 @@ SWITCH_DECLARE(switch_status_t) _switch_cache_db_get_db_handle(switch_cache_db_h
 
 		new_dbh = create_handle(type);
 
-		switch_log_printf(SWITCH_CHANNEL_ID_LOG, file, func, line, NULL, SWITCH_LOG_DEBUG10,
-						  "Create Cached DB handle %s [%s] %s:%d\n", new_dbh->name, switch_cache_db_type_name(type), file, line);
+		/* The connection options are a union, so in_memory and db_path only carry meaning
+		   for SCDB_TYPE_CORE_DB - for the other types they alias odbc_options.dsn and
+		   .user respectively. Keeping those types on DEBUG10 also keeps their credentials
+		   out of the default log: dbh->name is the db_str built above, which carries
+		   user= and pass= for ODBC and the full connection string for a database interface. */
+		if (type == SCDB_TYPE_CORE_DB) {
+			switch_log_printf(SWITCH_CHANNEL_ID_LOG, file, func, line, NULL, SWITCH_LOG_INFO,
+							  "Create Cached DB handle %s [%s, in_memory=%d, path=%s] %s:%d\n", new_dbh->name,
+							  switch_cache_db_type_name(type), connection_options->core_db_options.in_memory,
+							  connection_options->core_db_options.db_path, file, line);
+		} else {
+			switch_log_printf(SWITCH_CHANNEL_ID_LOG, file, func, line, NULL, SWITCH_LOG_DEBUG10,
+							  "Create Cached DB handle %s [%s] %s:%d\n", new_dbh->name, switch_cache_db_type_name(type), file, line);
+		}
 
 		if (database_interface_dbh) {
 			new_dbh->native_handle.database_interface_dbh = database_interface_dbh;
