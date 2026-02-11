@@ -4471,7 +4471,7 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 		if (switch_rtp_ready(engine->rtp_session) && engine->ice_in.cands[engine->ice_in.chosen[0]][0].ready) {
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_INFO, "RE-Activating %s ICE\n", type2str(type));
 
-			switch_rtp_activate_ice(engine->rtp_session,
+			switch_rtp_activate_ice_v2(engine->rtp_session,
 									engine->ice_in.ufrag,
 									engine->ice_out.ufrag,
 									engine->ice_out.pwd,
@@ -4479,10 +4479,10 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 									IPR_RTP,
 #ifdef GOOGLE_ICE
 									ICE_GOOGLE_JINGLE,
-									NULL
+									NULL, NULL
 #else
 									switch_determine_ice_type(engine, smh->session),
-									&engine->ice_in
+									&engine->ice_in, &engine->ice_out
 #endif
 									);
 
@@ -4525,7 +4525,7 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 			} else {
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_INFO, "Activating %s RTCP ICE\n", type2str(type));
 
-				switch_rtp_activate_ice(engine->rtp_session,
+				switch_rtp_activate_ice_v2(engine->rtp_session,
 										engine->ice_in.ufrag,
 										engine->ice_out.ufrag,
 										engine->ice_out.pwd,
@@ -4533,10 +4533,10 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 										IPR_RTCP,
 #ifdef GOOGLE_ICE
 										ICE_GOOGLE_JINGLE,
-										NULL
+										NULL, NULL
 #else
 										switch_determine_ice_type(engine, smh->session),
-										&engine->ice_in
+										&engine->ice_in, &engine->ice_out
 #endif
 										);
 			}
@@ -8989,7 +8989,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Activating Audio ICE\n");
 
-			switch_rtp_activate_ice(a_engine->rtp_session,
+			switch_rtp_activate_ice_v2(a_engine->rtp_session,
 									a_engine->ice_in.ufrag,
 									a_engine->ice_out.ufrag,
 									a_engine->ice_out.pwd,
@@ -8997,10 +8997,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 									IPR_RTP,
 #ifdef GOOGLE_ICE
 									ICE_GOOGLE_JINGLE,
-									NULL
+									NULL, NULL
 #else
 									switch_determine_ice_type(a_engine, session),
-									&a_engine->ice_in
+									&a_engine->ice_in, &a_engine->ice_out
 #endif
 									);
 
@@ -9042,7 +9042,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 				} else {
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Activating RTCP ICE\n");
 
-					switch_rtp_activate_ice(a_engine->rtp_session,
+					switch_rtp_activate_ice_v2(a_engine->rtp_session,
 											a_engine->ice_in.ufrag,
 											a_engine->ice_out.ufrag,
 											a_engine->ice_out.pwd,
@@ -9050,10 +9050,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 											IPR_RTCP,
 #ifdef GOOGLE_ICE
 											ICE_GOOGLE_JINGLE,
-											NULL
+											NULL, NULL
 #else
 											switch_determine_ice_type(a_engine, session),
-											&a_engine->ice_in
+											&a_engine->ice_in, &a_engine->ice_out
 #endif
 										);
 				}
@@ -9350,7 +9350,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Activating Text ICE\n");
 
-					switch_rtp_activate_ice(t_engine->rtp_session,
+					switch_rtp_activate_ice_v2(t_engine->rtp_session,
 											t_engine->ice_in.ufrag,
 											t_engine->ice_out.ufrag,
 											t_engine->ice_out.pwd,
@@ -9358,10 +9358,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 											IPR_RTP,
 #ifdef GOOGLE_ICE
 											ICE_GOOGLE_JINGLE,
-											NULL
+											NULL, NULL
 #else
 											switch_determine_ice_type(t_engine, session),
-											&t_engine->ice_in
+											&t_engine->ice_in, &t_engine->ice_out
 #endif
 											);
 
@@ -9401,7 +9401,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Skipping TEXT RTCP ICE (Same as TEXT RTP)\n");
 						} else {
 							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Activating TEXT RTCP ICE\n");
-							switch_rtp_activate_ice(t_engine->rtp_session,
+							switch_rtp_activate_ice_v2(t_engine->rtp_session,
 													t_engine->ice_in.ufrag,
 													t_engine->ice_out.ufrag,
 													t_engine->ice_out.pwd,
@@ -9409,10 +9409,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 													IPR_RTCP,
 #ifdef GOOGLE_ICE
 													ICE_GOOGLE_JINGLE,
-													NULL
+													NULL, NULL
 #else
 													switch_determine_ice_type(t_engine, session),
-													&t_engine->ice_in
+													&t_engine->ice_in, &t_engine->ice_out
 #endif
 													);
 
@@ -9671,7 +9671,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Activating Video ICE\n");
 
-					switch_rtp_activate_ice(v_engine->rtp_session,
+					switch_rtp_activate_ice_v2(v_engine->rtp_session,
 											v_engine->ice_in.ufrag,
 											v_engine->ice_out.ufrag,
 											v_engine->ice_out.pwd,
@@ -9679,10 +9679,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 											IPR_RTP,
 #ifdef GOOGLE_ICE
 											ICE_GOOGLE_JINGLE,
-											NULL
+											NULL, NULL
 #else
 											switch_determine_ice_type(v_engine, session),
-											&v_engine->ice_in
+											&v_engine->ice_in, &v_engine->ice_out
 #endif
 											);
 
@@ -9723,7 +9723,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 						} else {
 
 							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Activating VIDEO RTCP ICE\n");
-							switch_rtp_activate_ice(v_engine->rtp_session,
+							switch_rtp_activate_ice_v2(v_engine->rtp_session,
 													v_engine->ice_in.ufrag,
 													v_engine->ice_out.ufrag,
 													v_engine->ice_out.pwd,
@@ -9731,10 +9731,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 													IPR_RTCP,
 #ifdef GOOGLE_ICE
 													ICE_GOOGLE_JINGLE,
-													NULL
+													NULL, NULL
 #else
 													switch_determine_ice_type(v_engine, session),
-													&v_engine->ice_in
+													&v_engine->ice_in, &v_engine->ice_out
 #endif
 													);
 
