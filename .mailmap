@@ -1,2 +1,32 @@
 Anthony Minessale <anthm@freeswitch.org> Anthony Minessale <anthony.minessale@gmail.com>
 Anthony Minessale <anthm@freeswitch.org> Anthony Minessale II <anthony.minessale@gmail.com>
+
+# --- C4B -------------------------------------------------------------------
+# Normalisation of the git identities of the C4B fork. Several people have
+# committed under changing git names and email addresses.
+# Derivation and evidence: repo xcc_patches, docs/identities.md
+# https://dev.azure.com/c4bag/C4B%20UC/_git/xcc_patches (Stand 2026-08-11)
+
+# Alexander Haugg - 4 identities, same GitHub ID 72193284
+Alexander Haugg <alexander.haugg@c4b.de> <alexander.haugg@c4b.de>
+Alexander Haugg <alexander.haugg@c4b.de> <72193284+Alexanderdgg@users.noreply.github.com>
+Alexander Haugg <alexander.haugg@c4b.de> <hau@user.local>
+Alexander Haugg <alexander.haugg@c4b.de> <hau@c4bag.onmicrosoft.com>
+
+# Andreas Rossi - including commits as root on ROSDEBIAN10VM
+Andreas Rossi <andreas.rossi@c4b.de> <andreas.rossi@c4b.de>
+Andreas Rossi <andreas.rossi@c4b.de> <root@ROSDEBIAN10VM.corp.c4b.de>
+
+# Michael Hufnagel
+Michael Hufnagel <Michael.Hufnagel@c4b.de> <huf@corp.c4b.de>
+Michael Hufnagel <Michael.Hufnagel@c4b.de> <128606309+c4bhuf@users.noreply.github.com>
+
+# Philipp Steininger
+Philipp Steininger <philipp.steininger@c4b.de> <philipp.steininger@c4b.de>
+
+# Karlheinz Reinhardt
+Karlheinz Reinhardt <Karlheinz.Reinhardt@c4b.de> <128501175+c4brei@users.noreply.github.com>
+
+# Johannes Blau - two GitHub accounts of the same person
+Johannes Blau <johannes.blau@c4b.de> <60918970+blauj@users.noreply.github.com>
+Johannes Blau <johannes.blau@c4b.de> <31277696+C4BBla@users.noreply.github.com>
