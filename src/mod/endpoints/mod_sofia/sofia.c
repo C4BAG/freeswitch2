@@ -10296,8 +10296,8 @@ void sofia_handle_sip_i_reinvite(switch_core_session_t *session,
 	{
 		const char* ua = switch_channel_get_variable(channel, "sip_user_agent");
 		if (ua &&
-			(switch_string_match(ua, strlen(ua) - 1, "OpenScape 4000", 13) == SWITCH_STATUS_SUCCESS ||
-			 switch_string_match(ua, strlen(ua) - 1, "anynode", 7) == SWITCH_STATUS_SUCCESS)) {
+			(switch_string_match(ua, strlen(ua), "OpenScape 4000", 13) == SWITCH_STATUS_SUCCESS ||
+			 switch_string_match(ua, strlen(ua), "anynode", 7) == SWITCH_STATUS_SUCCESS)) {
 
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "Potential update callee ID\n");
 
@@ -10312,7 +10312,7 @@ void sofia_handle_sip_i_reinvite(switch_core_session_t *session,
 				sofia_update_callee_id(session, profile, sip, SWITCH_TRUE);
 			}
 		}
-		if (!sip->sip_payload && ua && switch_string_match(ua, strlen(ua) - 1, "OpenScape Business", 17) == SWITCH_STATUS_SUCCESS) {
+		if (!sip->sip_payload && ua && switch_string_match(ua, strlen(ua), "OpenScape Business", 17) == SWITCH_STATUS_SUCCESS) {
 			switch_channel_set_variable(channel, "osb_no_sdp", "true");
 		}
 	}
