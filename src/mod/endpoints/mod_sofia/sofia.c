@@ -10303,10 +10303,10 @@ void sofia_handle_sip_i_reinvite(switch_core_session_t *session,
 
 			if (sip->sip_referred_by) {
 				if (sip->sip_referred_by->b_display) {
-					switch_channel_set_variable_printf(channel, "sip_reffered-by_name", "%d", sip->sip_referred_by->b_display);
+					switch_channel_set_variable_strip_quotes(channel, "sip_referred-by_name", sip->sip_referred_by->b_display);
 				}
 				if (sip->sip_referred_by->b_cid) {
-					switch_channel_set_variable_printf(channel, "sip_reffered-by_cid", "%d", sip->sip_referred_by->b_cid);
+					switch_channel_set_variable(channel, "sip_referred-by_cid", sip->sip_referred_by->b_cid);
 				}
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "Update callee ID\n");
 				sofia_update_callee_id(session, profile, sip, SWITCH_TRUE);
