@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -72,6 +72,18 @@
     <Import Project="..\..\..\..\w32\module_debug.props" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Label="DotNetHost">
+    <!-- nethost.h, coreclr_delegates.h, hostfxr.h and libnethost.lib come from
+         the .NET host pack, not from this repository. The version is pinned here
+         and has to match COREHOST_PATH in Makefile.am. Override it on the command
+         line with /p:DotNetHostVersion=x.y.z to build against another runtime. -->
+    <DotNetHostVersion Condition="'$(DotNetHostVersion)' == ''">10.0.10</DotNetHostVersion>
+    <DotNetHostRid Condition="'$(Platform)' == 'x64'">win-x64</DotNetHostRid>
+    <DotNetHostRid Condition="'$(Platform)' == 'Win32'">win-x86</DotNetHostRid>
+    <DotNetPacksRoot Condition="'$(DotNetPacksRoot)' == '' and '$(DOTNET_ROOT)' != ''">$(DOTNET_ROOT)\packs</DotNetPacksRoot>
+    <DotNetPacksRoot Condition="'$(DotNetPacksRoot)' == ''">$(ProgramW6432)\dotnet\packs</DotNetPacksRoot>
+    <DotNetHostDir>$(DotNetPacksRoot)\Microsoft.NETCore.App.Host.$(DotNetHostRid)\$(DotNetHostVersion)\runtimes\$(DotNetHostRid)\native</DotNetHostDir>
+  </PropertyGroup>
   <PropertyGroup>
     <_ProjectFileVersion>10.0.30319.1</_ProjectFileVersion>
     <OutDir Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">$(SolutionDir)$(PlatformName)\Debug\mod\</OutDir>
@@ -85,7 +97,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
-      <AdditionalIncludeDirectories>C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Host.win-x86\5.0.4\runtimes\win-x64\native;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(DotNetHostDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <MinimalRebuild>false</MinimalRebuild>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
@@ -96,14 +108,14 @@
       <PreprocessorDefinitions>_DEBUG;DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>nethost.lib;shlwapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libnethost.lib;shlwapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>
       </ModuleDefinitionFile>
       <AssemblyDebug>
       </AssemblyDebug>
       <DataExecutionPrevention>false</DataExecutionPrevention>
       <AdditionalOptions>/ignore:4248 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalLibraryDirectories>C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Host.win-x86\5.0.4\runtimes\win-x64\native;$(curlLibDir)\binaries\$(Platform)\$(LibraryConfiguration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(DotNetHostDir);$(curlLibDir)\binaries\$(Platform)\$(LibraryConfiguration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -111,7 +123,7 @@
       <TargetEnvironment>X64</TargetEnvironment>
     </Midl>
     <ClCompile>
-      <AdditionalIncludeDirectories>C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Host.win-x64\8.0.0\runtimes\win-x64\native;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(DotNetHostDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <MinimalRebuild>false</MinimalRebuild>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
@@ -130,13 +142,13 @@
       <DataExecutionPrevention>false</DataExecutionPrevention>
       <TargetMachine>MachineX64</TargetMachine>
       <AdditionalOptions>/ignore:4248 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalLibraryDirectories>C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Host.win-x64\8.0.0\runtimes\win-x64\native;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(DotNetHostDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <AdditionalIncludeDirectories>C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Host.win-x86\5.0.4\runtimes\win-x64\native;..\..\..\..\libs\apr\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(DotNetHostDir);..\..\..\..\libs\apr\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <PrecompiledHeader>
@@ -151,8 +163,8 @@
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <AdditionalOptions>/ignore:4248 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalDependencies>nethost.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;Ws2_32.lib;Iphlpapi.lib;Winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Host.win-x86\5.0.4\runtimes\win-x64\native;$(curlLibDir)\binaries\$(Platform)\$(LibraryConfiguration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>libnethost.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;Ws2_32.lib;Iphlpapi.lib;Winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(DotNetHostDir);$(curlLibDir)\binaries\$(Platform)\$(LibraryConfiguration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <GenerateDebugInformation>false</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
@@ -162,7 +174,7 @@
     </Midl>
     <ClCompile>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <AdditionalIncludeDirectories>C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Host.win-x64\8.0.0\runtimes\win-x64\native;..\..\..\..\libs\apr\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(DotNetHostDir);..\..\..\..\libs\apr\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <PrecompiledHeader>
@@ -179,7 +191,7 @@
       <TargetMachine>MachineX64</TargetMachine>
       <AdditionalOptions>/ignore:4248 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalDependencies>libnethost.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;Ws2_32.lib;Iphlpapi.lib;Winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Host.win-x64\8.0.0\runtimes\win-x64\native;$(curlLibDir)\binaries\$(Platform)\$(LibraryConfiguration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(DotNetHostDir);$(curlLibDir)\binaries\$(Platform)\$(LibraryConfiguration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <GenerateDebugInformation>false</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
@@ -201,6 +213,10 @@
       <Project>{202d7a4e-760d-4d0e-afa1-d7459ced30ff}</Project>
     </ProjectReference>
   </ItemGroup>
+  <Target Name="CheckDotNetHostPack" BeforeTargets="ClCompile">
+    <Error Condition="!Exists('$(DotNetHostDir)\nethost.h')"
+           Text="The .NET host pack $(DotNetHostVersion) for $(DotNetHostRid) is not installed - $(DotNetHostDir) does not exist. Install the matching .NET SDK, or build with /p:DotNetHostVersion=&lt;installed version&gt;." />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
