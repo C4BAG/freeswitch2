@@ -1562,6 +1562,7 @@ SWITCH_STANDARD_API(stun_ipv6_function)
 			if ((p = strchr(src_ip, ']'))) {
 				int iport;
 				*p++ = '\0';
+				ip = src_ip;
 
 				if ((p = strchr(p, ':'))) {
 					p++;
