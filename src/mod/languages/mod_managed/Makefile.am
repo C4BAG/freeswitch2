@@ -15,14 +15,14 @@ BUILT_SOURCES=FreeSWITCH.Managed.dll
 CS_SRC=$(MANAGED_SRCDIR)/AssemblyInfo.cs $(MANAGED_SRCDIR)/Extensions.cs $(MANAGED_SRCDIR)/Loader.cs $(MANAGED_SRCDIR)/Log.cs
 CS_SRC+=$(MANAGED_SRCDIR)/ManagedSession.cs $(MANAGED_SRCDIR)/PluginInterfaces.cs
 CS_SRC+=$(MANAGED_SRCDIR)/PluginManager.cs $(MANAGED_SRCDIR)/ScriptPluginManager.cs $(MANAGED_SRCDIR)/ChannelVariables.cs $(MANAGED_SRCDIR)/Util.cs
-CS_SRC+=$(MANAGED_SRCDIR)/swig.cs $(MANAGED_SRCDIR)/XmlSearchBinding.cs
+CS_SRC+=$(MANAGED_SRCDIR)/swig.cs $(MANAGED_SRCDIR)/XmlSearchBinding.cs $(MANAGED_SRCDIR)/EventBinding.cs
 
 freeswitch_managed.o: freeswitch_managed.h freeswitch_managed.cpp
 
 reswig: swigclean freeswitch_wrap.cxx
 
 FreeSWITCH.Managed.dll: $(CS_SRC)
-	dmcs -target:library -out:FreeSWITCH.Managed.dll $(CS_SRC)
+	mcs -target:library -out:FreeSWITCH.Managed.dll $(CS_SRC)
 
 install-data-local: FreeSWITCH.Managed.dll
 	mkdir -p $(DESTDIR)$(modulesdir)/managed
