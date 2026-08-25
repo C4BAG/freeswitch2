@@ -40,15 +40,19 @@
 /*
  * 64-bit network byte-order helpers for the ICE tiebreaker (RFC 8445). winsock2.h
  * provides htonll/ntohll on Windows; glibc and most other platforms do not, so
- * provide a portable fallback built from the 32-bit htonl (correct on little- and
- * big-endian) to keep this a cross-platform build. Only the plain-variable call
- * sites in switch_stun.c/switch_rtp.c use these, so the macro arg is never a
- * side-effecting expression.
+ * provide a portable fallback built from the 32-bit htonl to keep this a
+ * cross-platform build. Only the plain-variable call sites in switch_stun.c
+ * and switch_rtp.c use these, so the macro arg is never a side-effecting
+ * expression.
  */
 #ifndef _WIN32
 #include <arpa/inet.h>
 #ifndef htonll
-#define htonll(x) ((((uint64_t)htonl((uint32_t)((x) & 0xFFFFFFFFULL))) << 32) | htonl((uint32_t)((x) >> 32)))
+/* htonl(1) == 1 only on a big-endian host, where the conversion is the identity.
+   The compiler folds the test away. Without it the swap below would exchange the
+   two 32-bit halves there instead of doing nothing. */
+#define htonll(x) (htonl(1) == 1 ? (uint64_t)(x) \
+	: ((((uint64_t)htonl((uint32_t)((x) & 0xFFFFFFFFULL))) << 32) | htonl((uint32_t)((x) >> 32))))
 #endif
 #ifndef ntohll
 #define ntohll(x) htonll(x)
