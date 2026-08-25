@@ -144,15 +144,21 @@ SWITCH_DECLARE(void) switch_stun_random_string(char *buf, uint16_t len, char *se
 SWITCH_DECLARE(uint64_t) switch_stun_random_tiebreaker(void)
 {
 	uint64_t ret = 0;
-	/* switch_rand() is CSPRNG-backed (BCryptGenRandom / urandom) but returns only
-	   SWITCH_RAND_MAX (15) bits, so combine several calls to fill the tiebreaker.
+	/* switch_rand() is CSPRNG-backed (BCryptGenRandom / urandom). Take a fixed 15
+	   bits per draw rather than SWITCH_RAND_MAX bits: that macro resolves to
+	   RAND_MAX whenever RAND_MAX is all-ones, which means 31 bits under glibc and
+	   15 under MSVC. OR-ing 31 bits into a 15-bit shift would overlap the previous
+	   draw, so most bits would be the OR of two or three random bits and thus 1 far
+	   more often than not - a tiebreaker that is systematically large wins nearly
+	   every RFC 8445 role conflict instead of half of them. Five draws of 15 bits
+	   cover all 64 bits.
 	   Keep the value in the positive int64 range: some clients still in the field
 	   interpret the RFC 8445 tiebreaker as a signed int64, and a set top bit would
 	   flip their comparison. */
 	while (ret == 0) {
 		int i;
 		for (i = 0; i < 5; i++) {
-			ret = (ret << 15) | (uint64_t)(switch_rand() & SWITCH_RAND_MAX);
+			ret = (ret << 15) | (uint64_t)(switch_rand() & 0x7FFF);
 		}
 		ret &= 0x7FFFFFFFFFFFFFFFULL;
 	}
