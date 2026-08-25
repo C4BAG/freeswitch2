@@ -4,8 +4,8 @@ Anthony Minessale <anthm@freeswitch.org> Anthony Minessale II <anthony.minessale
 # --- C4B -------------------------------------------------------------------
 # Normalisation of the git identities of the C4B fork. Several people have
 # committed under changing git names and email addresses.
-# Derivation and evidence: repo xcc_patches, docs/identities.md
-# https://dev.azure.com/c4bag/C4B%20UC/_git/xcc_patches (Stand 2026-08-11)
+# Derivation and evidence: repo xcc-patches, docs/identities.md
+# https://dev.azure.com/c4bag/C4B%20UC/_git/xcc-patches (as of 2026-08-11)
 
 # Alexander Haugg - 4 identities, same GitHub ID 72193284
 Alexander Haugg <alexander.haugg@c4b.de> <alexander.haugg@c4b.de>
