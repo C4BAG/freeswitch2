@@ -22,7 +22,7 @@ freeswitch_managed.o: freeswitch_managed.h freeswitch_managed.cpp
 reswig: swigclean freeswitch_wrap.cxx
 
 FreeSWITCH.Managed.dll: $(CS_SRC)
-	dmcs -target:library -out:FreeSWITCH.Managed.dll $(CS_SRC)
+	mcs -target:library -out:FreeSWITCH.Managed.dll $(CS_SRC)
 
 install-data-local: FreeSWITCH.Managed.dll
 	mkdir -p $(DESTDIR)$(modulesdir)/managed
