@@ -1209,6 +1209,7 @@ void sofia_update_callee_id(switch_core_session_t *session, sofia_profile_t *pro
 {
 	switch_channel_t *channel = switch_core_session_get_channel(session);
 	sip_p_asserted_identity_t *passerted = NULL;
+	sip_p_preferred_identity_t* ppreferred = NULL;
 	char *name = NULL;
 	const char *number, *tmp;
 	switch_caller_profile_t *caller_profile;
@@ -1286,6 +1287,22 @@ void sofia_update_callee_id(switch_core_session_t *session, sofia_profile_t *pro
 			}
 			if (!zstr(rpid->rpid_display)) {
 				dup = strdup(rpid->rpid_display);
+				switch_assert(dup);
+				if (*dup == '"') {
+					name = dup + 1;
+				} else {
+					name = dup;
+				}
+				if (end_of(name) == '"') {
+					end_of(name) = '\0';
+				}
+			}
+		} else if ((ppreferred = sip_p_preferred_identity(sip))) {
+			if (ppreferred->ppid_url->url_user) {
+				number = ppreferred->ppid_url->url_user;
+			}
+			if (!zstr(ppreferred->ppid_display)) {
+				dup = strdup(ppreferred->ppid_display);
 				switch_assert(dup);
 				if (*dup == '"') {
 					name = dup + 1;
@@ -3158,7 +3175,7 @@ void *SWITCH_THREAD_FUNC sofia_profile_thread_run(switch_thread_t *thread, void 
 		goto db_fail;
 	}
 
-	supported = switch_core_sprintf(profile->pool, "%s%s%spath, replaces", use_100rel ? "100rel, " : "", use_timer ? "timer, " : "", use_rfc_5626 ? "outbound, " : "");
+	supported = switch_core_sprintf(profile->pool, "%s%s%spath, replaces, from-change", use_100rel ? "100rel, " : "", use_timer ? "timer, " : "", use_rfc_5626 ? "outbound, " : "");
 
 	if (sofia_test_pflag(profile, PFLAG_AUTO_NAT) && switch_nat_get_type()) {
 		if ( (! sofia_test_pflag(profile, PFLAG_TLS) || ! profile->tls_only) && switch_nat_add_mapping(profile->sip_port, SWITCH_NAT_UDP, NULL, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS) {
@@ -7427,8 +7444,19 @@ static void sofia_handle_sip_i_state(switch_core_session_t *session, int status,
 					r_sdp = tech_pvt->mparams.last_sdp_response;
 				}
 			} else if (ss_state == nua_callstate_received || ss_state == nua_callstate_ready) {
+				const char* osb_no_sdp = switch_channel_get_variable(channel, "osb_no_sdp");
 				if (tech_pvt->mparams.last_sdp_str) {
 					r_sdp = tech_pvt->mparams.last_sdp_str;
+				}
+				else if (channel && osb_no_sdp) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "OpenScape Business osb_no_sdp %s\n", osb_no_sdp);
+					if (tech_pvt->mparams.prev_sdp_str) {
+						char* tmp = switch_string_replace(tech_pvt->mparams.prev_sdp_str, "inactive", "sendrecv");
+						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "Adapted remote SDP %s\n", tmp);
+						r_sdp = switch_core_session_strdup(session, tmp);
+						free(tmp);
+					}
+					switch_channel_set_variable(channel, "osb_no_sdp", NULL);
 				}
 			}
 		}
@@ -10264,6 +10292,31 @@ void sofia_handle_sip_i_reinvite(switch_core_session_t *session,
 		}
 	}
 
+	if (session && channel && sip && sip->sip_user_agent)
+	{
+		const char* ua = switch_channel_get_variable(channel, "sip_user_agent");
+		if (ua &&
+			(switch_string_match(ua, strlen(ua), "OpenScape 4000", 13) == SWITCH_STATUS_SUCCESS ||
+			 switch_string_match(ua, strlen(ua), "anynode", 7) == SWITCH_STATUS_SUCCESS)) {
+
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "Potential update callee ID\n");
+
+			if (sip->sip_referred_by) {
+				if (sip->sip_referred_by->b_display) {
+					switch_channel_set_variable_strip_quotes(channel, "sip_referred-by_name", sip->sip_referred_by->b_display);
+				}
+				if (sip->sip_referred_by->b_cid) {
+					switch_channel_set_variable(channel, "sip_referred-by_cid", sip->sip_referred_by->b_cid);
+				}
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "Update callee ID\n");
+				sofia_update_callee_id(session, profile, sip, SWITCH_TRUE);
+			}
+		}
+		if (!sip->sip_payload && ua && switch_string_match(ua, strlen(ua), "OpenScape Business", 17) == SWITCH_STATUS_SUCCESS) {
+			switch_channel_set_variable(channel, "osb_no_sdp", "true");
+		}
+	}
+
 	if (session && profile && sip && sofia_test_pflag(profile, PFLAG_TRACK_CALLS)) {
 		switch_channel_t *channel = switch_core_session_get_channel(session);
 		private_object_t *tech_pvt = (private_object_t *) switch_core_session_get_private(session);
@@ -11540,7 +11593,20 @@ void sofia_handle_sip_i_invite(switch_core_session_t *session, nua_t *nua, sofia
 				if (!zstr(un->un_value)) {
 					char *tmp_name;
 					if ((tmp_name = switch_mprintf("%s%s", SOFIA_SIP_HEADER_PREFIX, un->un_name))) {
-						switch_channel_set_variable(channel, tmp_name, un->un_value);
+
+						const char* diversion_var = switch_channel_get_variable(channel, tmp_name);
+						if (!zstr(diversion_var)) {
+							char* tmp_str;
+							if ((tmp_str = switch_mprintf("%s, %s", diversion_var, un->un_value))) {
+								switch_channel_set_variable(channel, tmp_name, tmp_str);
+								free(tmp_str);
+							}
+							else {
+								switch_channel_set_variable(channel, tmp_name, un->un_value);
+							}
+						} else {
+							switch_channel_set_variable(channel, tmp_name, un->un_value);
+						}
 						free(tmp_name);
 					}
 				}
