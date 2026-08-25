@@ -2141,6 +2141,7 @@ AC_CONFIG_FILES([Makefile
 		src/mod/languages/mod_java/Makefile
 		src/mod/languages/mod_lua/Makefile
 		src/mod/languages/mod_managed/Makefile
+		src/mod/languages/mod_managedcore/Makefile
 		src/mod/languages/mod_perl/Makefile
 		src/mod/languages/mod_python3/Makefile
 		src/mod/languages/mod_v8/Makefile

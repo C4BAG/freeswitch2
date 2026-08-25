@@ -1,0 +1,11 @@
+--- switch_event.cs.old
++++ switch_event.cs
+@@ -40,7 +40,7 @@
+     Dispose(false);
+   }
+ 
+-  public void Dispose() {
++  public virtual void Dispose() {
+     Dispose(true);
+     global::System.GC.SuppressFinalize(this);
+   }
