@@ -935,7 +935,7 @@ Description: documentation for FreeSWITCH
  It may be an empty package at the moment.
 
 Package: c4b-freeswitch-meta-all
-Architecture: amd64 armhf
+Architecture: amd64 armhf arm64
 Depends: \${misc:Depends}, freeswitch (= \${binary:Version}),
  freeswitch-init,
  freeswitch-lang (= \${binary:Version}),
