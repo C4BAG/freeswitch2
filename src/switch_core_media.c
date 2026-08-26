@@ -157,6 +157,11 @@ struct switch_rtp_engine_s {
 	char *cand_acl[SWITCH_MAX_CAND_ACL];
 	int cand_acl_count;
 
+	/* Reserved UDP socket backing a synthetic trickle-ICE fake candidate (blackhole). Bound but
+	   never serviced: absorbs our own checks (no STUN reply, so the fake pair never validates) and
+	   stays bound (no ICMP port-unreachable on self-sends). Lives on the session pool. */
+	switch_socket_t *trickle_blackhole_sock;
+
 	ice_t ice_in;
 	ice_t ice_out;
 
@@ -3787,6 +3792,9 @@ static void clear_ice(switch_core_session_t *session, switch_media_type_t type)
 
 	engine = &smh->engines[type];
 
+	/* Clearing ice_in races the media thread that reads it under ice_mutex; serialize.
+	   NULL-safe before media is running. */
+	switch_rtp_ice_lock(engine->rtp_session);
 	engine->ice_in.chosen[0] = 0;
 	engine->ice_in.chosen[1] = 0;
 	engine->ice_in.is_chosen[0] = 0;
@@ -3794,6 +3802,7 @@ static void clear_ice(switch_core_session_t *session, switch_media_type_t type)
 	engine->ice_in.cand_idx[0] = 0;
 	engine->ice_in.cand_idx[1] = 0;
 	memset(&engine->ice_in, 0, sizeof(engine->ice_in));
+	switch_rtp_ice_unlock(engine->rtp_session);
 	engine->remote_rtcp_port = 0;
 
 	if (engine->rtp_session) {
@@ -3889,6 +3898,36 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_add_ice_acl(switch_core_sessio
 	return SWITCH_STATUS_FALSE;
 }
 
+SWITCH_DECLARE(switch_status_t) switch_core_media_check_ice_acl(switch_core_session_t *session, switch_media_type_t type, const char *addr)
+{
+	switch_media_handle_t *smh;
+	switch_rtp_engine_t *engine;
+
+	switch_assert(session);
+
+	if (strlen(addr) == 0) { 
+		return SWITCH_STATUS_MEMERR; 
+	}
+
+	if (!(smh = session->media_handle)) { 
+		return SWITCH_STATUS_GENERR; 
+	}
+
+	if (!(engine = &smh->engines[type])) { 
+		return SWITCH_STATUS_GENERR; 
+	}
+
+	for (int ai = 0; ai < engine->cand_acl_count; ai++) {
+		if (switch_check_network_list_ip(addr, engine->cand_acl[ai])) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_DEBUG6, "Candidate %s (%s) passed user acl \"%s\" (%d of %d)\n", addr, switch_media_type2str(type), engine->cand_acl[ai], ai + 1, engine->cand_acl_count);
+			return SWITCH_STATUS_SUCCESS;
+		}
+	}
+
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_DEBUG6, "Candidate %s (%s) denied by user acl\n", addr, switch_media_type2str(type));
+	return SWITCH_STATUS_FALSE;
+}
+
 //?
 SWITCH_DECLARE(void) switch_core_media_check_video_codecs(switch_core_session_t *session)
 {
@@ -3981,10 +4020,29 @@ static switch_core_media_ice_type_t switch_determine_ice_type(switch_rtp_engine_
 	if (switch_channel_var_true(session->channel, "ice_lite")) {
 		ice_type |= ICE_CONTROLLED;
 		ice_type |= ICE_LITE;
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG8, "Ice-Type from channel-variable 'ice_lite': ice_type: %d\n", ice_type);
+	} else if (switch_channel_var_true(session->channel, "ice_controlled")) { 
+		ice_type |= ICE_CONTROLLED; 
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG8, "Ice-Type from channel-variable 'ice_controlled': ice_type: %d\n", ice_type);
 	} else {
 		switch_call_direction_t direction = switch_ice_direction(engine, session);
 		if (direction == SWITCH_CALL_DIRECTION_INBOUND) {
 			ice_type |= ICE_CONTROLLED;
+		}
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG8, "Ice-Type from direction '%s': ice_type: %d\n", direction == SWITCH_CALL_DIRECTION_INBOUND? "inbound" : "outbound", ice_type);
+	}
+
+	if (switch_channel_var_true(session->channel, "ice_disable_dtls_protection")) {
+		ice_type |= ICE_DISABLE_DTLS_PROTECTION;
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG8, "Ice-Type from channel-variable 'ice_disable_dtls_protection': ice_type: %d\n", ice_type);
+	}
+
+	if (switch_channel_var_true(session->channel, "ice_nomination")) {
+		if (ice_type & ICE_CONTROLLED) {
+			ice_type |= ICE_NOMINATION;
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG8, "Ice-Type from channel-variable 'ice_nomination': ice_type: %d\n", ice_type);
+		} else {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "Channel-variable 'ice_nomination' ignored: nominated candidate selection applies only to controlled agents.\n");
 		}
 	}
 
@@ -4037,6 +4095,134 @@ static switch_bool_t ip_possible(switch_media_handle_t *smh, const char *ip)
 	return r;
 }
 
+#define proto2str(proto) (proto ? "rtcp" : "rtp")
+
+static void ice_sort_candidates(switch_media_handle_t *smh, switch_media_type_t type, ice_t *ice_params, ice_proto_t proto)
+{
+	switch_status_t res;
+	res = switch_rtp_ice_sort_candidates(ice_params, proto);
+	if (res == SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_DEBUG, "Sorted %d candidates for %s/%s.\n", ice_params->cand_idx[proto], type2str(type), proto2str(proto));
+	} else if (res != SWITCH_STATUS_FALSE) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_ERROR, "Sorting %d candidates for %s/%s failed: %d\n", ice_params->cand_idx[proto], type2str(type), proto2str(proto), res);
+	}
+}
+
+/* Reserve a blackhole UDP port for a synthetic trickle-ICE fake candidate. A socket is bound to
+   the given local media IP on an ephemeral port (port 0 -> OS picks a free port outside the RTP
+   range, so no collision with real media) and kept bound but unserviced for the session lifetime:
+   nothing reads it, so a check sent to it gets no STUN reply and the fake pair never validates;
+   staying bound means a same-host check raises no ICMP port-unreachable (which on Windows would
+   disturb the media socket recv). Returns the reserved port, or 0 on failure.
+   Note: the create/bind syscalls run while check_ice holds the ICE lock. Accepted: this is the
+   rare trickle path and the calls are fast (numeric IP, local bind), so the critical section is
+   extended only by microseconds. */
+static switch_port_t reserve_trickle_blackhole(switch_media_handle_t *smh, switch_rtp_engine_t *engine, const char *ip)
+{
+	switch_sockaddr_t *bh_addr = NULL, *bound = NULL;
+	switch_socket_t *sock = NULL;
+	switch_memory_pool_t *pool = switch_core_session_get_pool(smh->session);
+
+	if (switch_sockaddr_info_get(&bh_addr, ip, SWITCH_UNSPEC, 0, 0, pool) != SWITCH_STATUS_SUCCESS || !bh_addr) {
+		return 0;
+	}
+	if (switch_socket_create(&sock, switch_sockaddr_get_family(bh_addr), SOCK_DGRAM, 0, pool) != SWITCH_STATUS_SUCCESS) {
+		return 0;
+	}
+	switch_socket_opt_set(sock, SWITCH_SO_REUSEADDR, 1);
+	if (switch_socket_bind(sock, bh_addr) != SWITCH_STATUS_SUCCESS) {
+		switch_socket_close(sock);
+		return 0;
+	}
+	if (switch_socket_addr_get(&bound, SWITCH_FALSE, sock) != SWITCH_STATUS_SUCCESS || !bound) {
+		switch_socket_close(sock);
+		return 0;
+	}
+
+	if (engine->trickle_blackhole_sock) {
+		/* re-INVITE / re-injection: release the previous reservation instead of orphaning its fd */
+		switch_socket_close(engine->trickle_blackhole_sock);
+	}
+	engine->trickle_blackhole_sock = sock; /* hold open; closed on re-injection or with the session pool */
+	return switch_sockaddr_get_port(bound);
+}
+
+/* Trickle ICE (RFC 8838): when a peer offers ICE with a=ice-options:trickle but no candidate yet,
+   inject ONE synthetic candidate so the normal ICE path (choosing loop, ACL, activation) runs with
+   a valid target instead of failing. The candidate points at our own media IP + a reserved blackhole
+   port, so it is ACL-valid but inert (never validates). The real peer is learned as a peer-reflexive
+   from its incoming binding requests and, having a higher priority, wins the nomination. Returns 1
+   if a candidate was injected, 0 otherwise. */
+static int inject_trickle_fake_candidate(switch_media_handle_t *smh, switch_media_type_t type, switch_rtp_engine_t *engine)
+{
+	const char *ip;
+	switch_port_t port;
+	int idx;
+
+	/* Prefer IPv6 (passes the default wan.auto candidate ACL as a global address), else IPv4,
+	   else the engine's already-chosen local SDP IP. Using our own media IP guarantees
+	   ip_possible() and keeps the candidate within the configured candidate ACL. */
+	if (!zstr(smh->mparams->rtpip6)) {
+		ip = smh->mparams->rtpip6;
+	} else if (!zstr(smh->mparams->rtpip4)) {
+		ip = smh->mparams->rtpip4;
+	} else {
+		ip = engine->local_sdp_ip;
+	}
+
+	if (zstr(ip)) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_WARNING,
+						  "Trickle ICE: no local media IP available for a fake candidate\n");
+		return 0;
+	}
+
+	idx = engine->ice_in.cand_idx[0];
+	if (idx >= MAX_CAND - 1) {
+		return 0;
+	}
+
+	port = reserve_trickle_blackhole(smh, engine, ip);
+	if (!port) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_WARNING,
+						  "Trickle ICE: could not reserve a blackhole port for the fake candidate\n");
+		return 0;
+	}
+
+	/* Mirror the default the a=candidate parse path installs (wan.auto) so the choosing loop has
+	   an ACL to match against - including the same WARNING, so operators can see the fallback. */
+	if (!engine->cand_acl_count) {
+		engine->cand_acl[engine->cand_acl_count++] = "wan.auto";
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_WARNING, "NO candidate ACL defined, Defaulting to wan.auto\n");
+	}
+
+	/* Clear the slots first: check_ice does not memset ice_in.cands[][], so on a re-INVITE these
+	   reused indices may still hold responsive/use_candidate/ready/media_rcv_last/con_addr from a
+	   prior negotiation, which the media thread or the RTCP-ICE activation could mistake for an
+	   already-nominated pair / a live RTCP target. Clear both the RTP slot we populate and the
+	   RTCP component slot at the reused index (under rtcp-mux the choosing loop overwrites the
+	   RTCP slot from the RTP candidate; without mux it would otherwise stay stale). */
+	memset(&engine->ice_in.cands[idx][0], 0, sizeof(engine->ice_in.cands[idx][0]));
+	memset(&engine->ice_in.cands[engine->ice_in.chosen[1]][1], 0, sizeof(engine->ice_in.cands[engine->ice_in.chosen[1]][1]));
+
+	engine->ice_in.cands[idx][0].foundation = switch_core_session_strdup(smh->session, "1");
+	engine->ice_in.cands[idx][0].component_id = 1;
+	engine->ice_in.cands[idx][0].transport = switch_core_session_strdup(smh->session, "udp");
+	engine->ice_in.cands[idx][0].priority = 1; /* deliberately low: a learned peer-reflexive outranks it */
+	engine->ice_in.cands[idx][0].con_addr = switch_core_session_strdup(smh->session, ip);
+	engine->ice_in.cands[idx][0].con_port = port;
+	engine->ice_in.cands[idx][0].cand_type = switch_core_session_strdup(smh->session, "host");
+	engine->ice_in.cands[idx][0].generation = switch_core_session_strdup(smh->session, "");
+	engine->ice_in.cands[idx][0].raddr = switch_core_session_strdup(smh->session, "");
+	engine->ice_in.cand_idx[0]++;
+
+	switch_channel_set_flag(smh->session->channel, CF_ICE);
+
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_INFO,
+					  "Trickle ICE: injected fake %s candidate %s:%d (blackhole) - real peer will be learned from binding requests\n",
+					  type2str(type), ip, port);
+	return 1;
+}
+
 //?
 static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t type, sdp_session_t *sdp, sdp_media_t *m)
 {
@@ -4044,7 +4230,7 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 	sdp_attribute_t *attr = NULL, *attrs[2] = { 0 };
 	int i = 0, got_rtcp_mux = 0;
 	const char *val;
-	int ice_seen = 0, cid = 0, ai = 0, attr_idx = 0, cand_seen = 0, relay_ok = 0;
+	int ice_seen = 0, cid = 0, ai = 0, attr_idx = 0, cand_seen = 0, relay_ok = 0, trickle_no_cand = 0, trickle_seen = 0, cand_attr_seen = 0;
 	char con_addr[256];
 	int ice_resolve = 0;
 	ip_t ip;
@@ -4056,6 +4242,11 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 	//if (engine->ice_in.is_chosen[0] && engine->ice_in.is_chosen[1]) {
 		//return SWITCH_STATUS_SUCCESS;
 	//}
+
+	/* Serialize the ice_in mutation (reset/parse/sort/chosen selection) against the media
+	   thread, which reads engine->ice_in under ice_mutex. NULL-safe when media is not yet
+	   running (initial setup); relevant on re-INVITE / ICE restart. */
+	switch_rtp_ice_lock(engine->rtp_session);
 
 	engine->ice_in.chosen[0] = 0;
 	engine->ice_in.chosen[1] = 0;
@@ -4098,6 +4289,11 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 				}
 			} else if (!strcasecmp(attr->a_name, "ice-options")) {
 				engine->ice_in.options = switch_core_session_strdup(smh->session, attr->a_value);
+				/* Note trickle from THIS offer's parse - engine->ice_in.options persists across
+				   re-INVITEs and must not be used to gate the candidate-less accept below. */
+				if (switch_stristr("trickle", attr->a_value)) {
+					trickle_seen = 1;
+				}
 			} else if (!strcasecmp(attr->a_name, "setup")) {
 				if (!strcasecmp(attr->a_value, "passive") ||
 					(!strcasecmp(attr->a_value, "actpass") && !switch_channel_test_flag(smh->session->channel, CF_REINVITE))) {
@@ -4143,8 +4339,8 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 				switch_channel_set_flag(smh->session->channel, CF_DTLS);
 
 			} else if (!engine->remote_ssrc && !strcasecmp(attr->a_name, "ssrc") && attr->a_value) {
-				engine->remote_ssrc = (uint32_t) atol(attr->a_value);
-
+				// engine->remote_ssrc = (uint32_t) atol(attr->a_value); Error if the remote ssrc > LONG_MAX (2147483647)
+				engine->remote_ssrc = (uint32_t) strtoul(attr->a_value, NULL, 10);
 				if (engine->rtp_session && engine->remote_ssrc) {
 					switch_rtp_set_remote_ssrc(engine->rtp_session, engine->remote_ssrc);
 				}
@@ -4162,6 +4358,12 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 #endif
 			} else if (!strcasecmp(attr->a_name, "candidate")) {
 				switch_channel_set_flag(smh->session->channel, CF_ICE);
+
+				/* Count every candidate line the peer offered, BEFORE the parse-time drops below
+				   (non-udp, unresolvable, no network path). The trickle fake-candidate injection
+				   must only trigger when the peer offered NO candidate at all - an offer whose
+				   candidates were all dropped is not the trickle case and must still fail. */
+				cand_attr_seen++;
 
 				if (!engine->cand_acl_count) {
 					engine->cand_acl[engine->cand_acl_count++] = "wan.auto";
@@ -4257,18 +4459,44 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 		}
 	}
 
+	if (cand_seen) { 
+		ice_sort_candidates(smh, type, &engine->ice_in, IPR_RTP);
+		ice_sort_candidates(smh, type, &engine->ice_in, IPR_RTCP);
+	}
+
 	if (!ice_seen) {
+		switch_rtp_ice_unlock(engine->rtp_session);
 		return SWITCH_STATUS_SUCCESS;
 	}
 
+	/* Trickle ICE (RFC 8838): a candidate-less offer that signals trickle is valid - the peer
+	   trickles candidates later and/or we learn them from incoming binding requests. Only when
+	   THIS offer explicitly signaled trickle (trickle_seen, from the parse above - not the
+	   persistent engine->ice_in.options, which survives re-INVITEs) AND the offer carried NO
+	   a=candidate line at all (cand_attr_seen == 0). Gating on cand_attr_seen (candidate lines
+	   present), not cand_seen (candidates saved), so an offer whose candidates were all
+	   parse-dropped or ACL-rejected still fails below instead of getting a fake candidate. */
+	trickle_no_cand = (cand_attr_seen == 0 && trickle_seen);
+
+	if (trickle_no_cand) {
+		/* Inject one synthetic (blackhole) candidate so the normal ICE path (choosing loop, ACL,
+		   activation) runs with a valid, inert target instead of failing. The real peer is learned
+		   as a peer-reflexive from its incoming binding requests and wins the nomination. */
+		if (inject_trickle_fake_candidate(smh, type, engine)) {
+			cand_seen++;
+		}
+	}
+
 	relay_ok = 0;
-	
+
  relay:
 	
 	for (cid = 0; cid < MAX_CAND_IDX_COUNT; cid++) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_DEBUG, "Searching for %s candidate.\n", cid ? "rtcp" : "rtp");
 
 		for (ai = 0; ai < engine->cand_acl_count; ai++) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_DEBUG8, "Searching for %s candidate within ACL %s (%d of %d)\n", cid ? "rtcp" : "rtp", engine->cand_acl[ai], ai + 1, engine->cand_acl_count);
+
 			for (i = 0; i < engine->ice_in.cand_idx[cid]; i++) {
 				int is_relay = engine->ice_in.cands[i][cid].cand_type && !strcmp(engine->ice_in.cands[i][cid].cand_type, "relay");
 
@@ -4286,6 +4514,7 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 
 					if (cid == 0 && got_rtcp_mux && engine->ice_in.cand_idx[1] < MAX_CAND) {
 
+						// check whether the same candidate may already in the list of rtcp candidates?
 						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_DEBUG,
 										  "Choose same candidate, index %d, for rtcp based on rtcp-mux attribute %s:%d\n", engine->ice_in.cand_idx[1],
 										  engine->ice_in.cands[i][cid].con_addr, engine->ice_in.cands[i][cid].con_port);
@@ -4295,6 +4524,8 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 						engine->ice_in.chosen[1] = engine->ice_in.cand_idx[1];
 						engine->ice_in.is_chosen[1] = 1;
 						engine->ice_in.cand_idx[1]++;
+
+						ice_sort_candidates(smh, type, &engine->ice_in, IPR_RTCP);
 
 						goto done_choosing;
 					}
@@ -4321,6 +4552,7 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 		/* PUNT */
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_DEBUG, "%s no suitable candidates found.\n",
 						  switch_channel_get_name(smh->session->channel));
+		switch_rtp_ice_unlock(engine->rtp_session);
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -4339,7 +4571,7 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 
 		engine->cur_payload_map->remote_sdp_ip = switch_core_session_strdup(smh->session, (char *) engine->ice_in.cands[engine->ice_in.chosen[0]][0].con_addr);
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_DEBUG,
-						  "setting remote %s ice addr to index %d %s:%d based on candidate\n", type2str(type), engine->ice_in.chosen[0],
+						  "Setting remote %s ice addr to index %d %s:%d based on candidate\n", type2str(type), engine->ice_in.chosen[0],
 						  engine->ice_in.cands[engine->ice_in.chosen[0]][0].con_addr, engine->ice_in.cands[engine->ice_in.chosen[0]][0].con_port);
 		engine->ice_in.cands[engine->ice_in.chosen[0]][0].ready++;
 
@@ -4408,7 +4640,7 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 		if (switch_rtp_ready(engine->rtp_session) && engine->ice_in.cands[engine->ice_in.chosen[0]][0].ready) {
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_INFO, "RE-Activating %s ICE\n", type2str(type));
 
-			switch_rtp_activate_ice(engine->rtp_session,
+			switch_rtp_activate_ice_v2(engine->rtp_session,
 									engine->ice_in.ufrag,
 									engine->ice_out.ufrag,
 									engine->ice_out.pwd,
@@ -4416,10 +4648,10 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 									IPR_RTP,
 #ifdef GOOGLE_ICE
 									ICE_GOOGLE_JINGLE,
-									NULL
+									NULL, NULL
 #else
 									switch_determine_ice_type(engine, smh->session),
-									&engine->ice_in
+									&engine->ice_in, &engine->ice_out
 #endif
 									);
 
@@ -4462,7 +4694,7 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 			} else {
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(smh->session), SWITCH_LOG_INFO, "Activating %s RTCP ICE\n", type2str(type));
 
-				switch_rtp_activate_ice(engine->rtp_session,
+				switch_rtp_activate_ice_v2(engine->rtp_session,
 										engine->ice_in.ufrag,
 										engine->ice_out.ufrag,
 										engine->ice_out.pwd,
@@ -4470,10 +4702,10 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 										IPR_RTCP,
 #ifdef GOOGLE_ICE
 										ICE_GOOGLE_JINGLE,
-										NULL
+										NULL, NULL
 #else
 										switch_determine_ice_type(engine, smh->session),
-										&engine->ice_in
+										&engine->ice_in, &engine->ice_out
 #endif
 										);
 			}
@@ -4482,6 +4714,7 @@ static switch_status_t check_ice(switch_media_handle_t *smh, switch_media_type_t
 
 	}
 
+	switch_rtp_ice_unlock(engine->rtp_session);
 	return ice_seen ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_BREAK;
 }
 #ifdef _MSC_VER
@@ -8244,6 +8477,17 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_choose_port(switch_core_sessio
 		switch_channel_set_variable(session->channel, SWITCH_LOCAL_MEDIA_IP_VARIABLE, engine->local_sdp_ip);
 		switch_channel_set_variable_printf(session->channel, SWITCH_LOCAL_MEDIA_PORT_VARIABLE, "%d", sdp_port);
 		switch_channel_set_variable(session->channel, SWITCH_ADVERTISED_MEDIA_IP_VARIABLE, engine->adv_sdp_ip);
+
+		/* Dual-stack: expose ALL configured local media families (comma separated) so an early
+		   consumer - e.g. the pre-answer UDP hole puncher - has both local bind addresses before
+		   the local SDP string is serialized (rtp_local_sdp_str is only set later, after the
+		   pre-answer hook). The shared media port is local_media_port. Single-family: one address. */
+		if (!zstr(smh->mparams->rtpip4) && !zstr(smh->mparams->rtpip6)) {
+			switch_channel_set_variable_printf(session->channel, SWITCH_LOCAL_MEDIA_IP_LIST_VARIABLE, "%s,%s",
+											   smh->mparams->rtpip4, smh->mparams->rtpip6);
+		} else {
+			switch_channel_set_variable(session->channel, SWITCH_LOCAL_MEDIA_IP_LIST_VARIABLE, engine->local_sdp_ip);
+		}
 	} else if (type == SWITCH_MEDIA_TYPE_VIDEO) {
 		switch_channel_set_variable(session->channel, SWITCH_LOCAL_VIDEO_IP_VARIABLE, engine->adv_sdp_ip);
 		switch_channel_set_variable_printf(session->channel, SWITCH_LOCAL_VIDEO_PORT_VARIABLE, "%d", sdp_port);
@@ -8382,6 +8626,104 @@ SWITCH_DECLARE(void) switch_core_media_deactivate_rtp(switch_core_session_t *ses
 
 }
 
+// RFC 8445: priority = (2^24)*(type preference) + (2^8)*(local preference) + (2^0)*(256 - component ID)
+// external_priority=0 candidates may have equal priority, not allowed by RFC 8445
+/* Parse the "external_candidate_priority" channel variable (-1..2), clamping and warning
+   on out-of-range values, so gen_ice and the SDP emitters agree on a single value. */
+static int get_external_candidate_priority(switch_core_session_t *session)
+{
+	const char *tmp = switch_channel_get_variable_dup(session->channel, "external_candidate_priority", SWITCH_FALSE, -1);
+	int external_priority = 0;
+
+	if (tmp) {
+		external_priority = atoi(tmp);
+		if (external_priority < -1 || external_priority > 2) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+							  "external_candidate_priority '%s' out of range [-1..2], using 0\n", tmp);
+			external_priority = 0;
+		}
+	}
+
+	return external_priority;
+}
+
+static int get_ice_family_priority(switch_core_session_t *session)
+{
+	const char *tmp = switch_channel_get_variable_dup(session->channel, "ice_family_priority", SWITCH_FALSE, -1);
+	int family_priority = 0;
+
+	if (tmp) {
+		family_priority = atoi(tmp);
+		if (family_priority < -1 || family_priority > 1) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+							  "ice_family_priority '%s' out of range [-1..1], using 0 (IPv6 higher)\n", tmp);
+			family_priority = 0;
+		}
+	}
+
+	return family_priority;
+}
+
+/* Local-preference decrement applied to a host candidate of the given family, per the
+   ice_family_priority channel variable: 0 = IPv6 higher (default; IPv4 stepped down one
+   local-preference unit), 1 = IPv4 higher (IPv6 stepped down), -1 = equal (no
+   differentiation; violates RFC 8445 5.1.2.2 - diagnosis/compat only). RFC 8445 5.1.2.2
+   requires same-type candidates to have distinct local preferences; RFC 8421 / RFC 6724
+   motivate the IPv6-higher default. One local-preference step = (1 << 8). */
+static int ice_family_prio_dec(int is_v6, int family_priority)
+{
+	if (family_priority < 0) {
+		return 0;
+	}
+	if (family_priority == 1) {
+		return is_v6 ? (1 << 8) : 0;
+	}
+	return is_v6 ? 0 : (1 << 8);
+}
+
+static uint32_t calc_candidate_priority_host(int component_id, int external_priority)
+{
+	int local_preference_dec = 0;
+	switch_assert(component_id == 1 || component_id == 2);
+	switch_assert(external_priority >= -1 && external_priority <= 2);
+	if (external_priority > 0)
+		return (1 << 24) * 126 + (1 << 8) * (65525 - local_preference_dec) + (1 << 0) * (256 - component_id);
+	return (1 << 24) * 126 + (1 << 8) * (65535 - local_preference_dec) + (1 << 0) * (256 - component_id);
+}
+
+static uint32_t calc_candidate_priority_external(int component_id, int external_priority)
+{
+	int local_preference_dec = external_priority > 1 ? 1 : 0;
+	switch_assert(component_id == 1 || component_id == 2);
+	switch_assert(external_priority >= -1 && external_priority <= 2);
+	if (external_priority < 0)
+		return (1 << 24) * 126 + (1 << 8) * (65525 - local_preference_dec) + (1 << 0) * (256 - component_id);
+	return (1 << 24) * 126 + (1 << 8) * (65535 - local_preference_dec) + (1 << 0) * (256 - component_id); // higher than "srflx" because local_preference_dec is 1 vs. 2
+}
+
+static uint32_t calc_candidate_priority_srflx(int component_id, int external_priority, int external_candidate_srflx, int is_external)
+{
+	switch_assert(component_id == 1 || component_id == 2);
+	switch_assert(external_priority >= -1 && external_priority <= 2);
+
+	if (!external_candidate_srflx) {
+		/* Compatibility (external_candidate_srflx off): keep the pre-feature scheme -
+		   type preference 126, ranked just below the host of the same component (host
+		   priority minus 2) - so the default SDP is functionally unchanged. This matches
+		   the old gen_local_sdp values (c3/c4) exactly; for generate_m it harmonizes the
+		   srflx low byte to the same per-component scheme (old generate_m used c1-1 for
+		   both components). Type preference stays 126 and the host > srflx order is kept. */
+		return calc_candidate_priority_host(component_id, external_priority) - 2;
+	}
+
+	{
+		/* RFC 8445 5.1.2: server-reflexive type preference 100 (126 for external_priority
+		   > 1 to rank just below an external host). is_external lowers local preference by
+		   one so a co-emitted external and local srflx keep distinct priorities. */
+		int local_preference_dec = (external_priority > 1 ? 2 : 0) + (is_external ? 1 : 0);
+		return (1 << 24) * (external_priority > 1 ? 126 : 100) + (1 << 8) * (65535 - local_preference_dec) + (1 << 0) * (256 - component_id);
+	}
+}
 
 //?
 static void gen_ice(switch_core_session_t *session, switch_media_type_t type, const char *ip, switch_port_t port)
@@ -8397,6 +8739,10 @@ static void gen_ice(switch_core_session_t *session, switch_media_type_t type, co
 	}
 
 	engine = &smh->engines[type];
+
+	/* gen_ice writes engine->ice_out, which the media thread reads (via ice_params_out)
+	   under ice_mutex; serialize on re-generation. NULL-safe before media is running. */
+	switch_rtp_ice_lock(engine->rtp_session);
 
 	//#ifdef RTCP_MUX
 	//if (!engine->rtcp_mux) {//  && type == SWITCH_MEDIA_TYPE_AUDIO) {
@@ -8438,7 +8784,7 @@ static void gen_ice(switch_core_session_t *session, switch_media_type_t type, co
 
 	if (!engine->ice_out.cands[0][0].component_id) {
 		engine->ice_out.cands[0][0].component_id = 1;
-		engine->ice_out.cands[0][0].priority = (1<<24)*126 + (1<<8)*65535 + (1<<0)*(256 - engine->ice_out.cands[0][0].component_id);
+		engine->ice_out.cands[0][0].priority = calc_candidate_priority_host(engine->ice_out.cands[0][0].component_id, get_external_candidate_priority(session));
 	}
 
 	if (!zstr(ip)) {
@@ -8454,7 +8800,45 @@ static void gen_ice(switch_core_session_t *session, switch_media_type_t type, co
 
 	engine->ice_out.cands[0][0].ready = 1;
 
+	/* Media dual-stack (AUDIO only for now; video/text keep the single-candidate path).
+	   When both an IPv4 and an IPv6 media address are configured, also expose a host
+	   candidate for the OTHER family (same port - the port allocator is per-IP). cands[0][0]
+	   stays the choose_family() primary and drives the c= line, so single-family output is
+	   byte-identical (this block is skipped unless both families are present). Receiving on
+	   the second family is a later step; here we only advertise. The RFC 8421 family ranking
+	   is applied authoritatively in emit_ice_cand_lines; the priority stored here is a
+	   nominal diagnostic value (neither the emitted priority nor the STUN PRIORITY, which is
+	   derived from the remote list). */
+	if (type == SWITCH_MEDIA_TYPE_AUDIO) {
+		/* Reset the second-family slot every pass; (re)populated below only while
+		   dual-stack is active, so it never lingers stale from a prior generation. */
+		engine->ice_out.cands[1][0].ready = 0;
 
+		if (!zstr(smh->mparams->rtpip4) && !zstr(smh->mparams->rtpip6) && !zstr(engine->ice_out.cands[0][0].con_addr)) {
+			const char *primary = engine->ice_out.cands[0][0].con_addr;
+			const char *other = strchr(primary, ':') ? smh->mparams->rtpip4 : smh->mparams->rtpip6;
+
+			if (!zstr(other) && strcmp(primary, other)) {
+				engine->ice_out.cands[1][0].transport = "udp";
+				engine->ice_out.cands[1][0].component_id = 1;
+				engine->ice_out.cands[1][0].priority = calc_candidate_priority_host(1, get_external_candidate_priority(session));
+
+				if (!engine->ice_out.cands[1][0].foundation) {
+					char f[11] = "";
+					switch_stun_random_string(f, 10, "0123456789");
+					f[10] = '\0';
+					engine->ice_out.cands[1][0].foundation = switch_core_session_strdup(session, f);
+				}
+
+				engine->ice_out.cands[1][0].con_addr = switch_core_session_strdup(session, other);
+				engine->ice_out.cands[1][0].con_port = engine->ice_out.cands[0][0].con_port;
+				engine->ice_out.cands[1][0].generation = "0";
+				engine->ice_out.cands[1][0].ready = 1;
+			}
+		}
+	}
+
+	switch_rtp_ice_unlock(engine->rtp_session);
 }
 
 SWITCH_DECLARE(void) switch_core_session_wake_video_thread(switch_core_session_t *session)
@@ -8862,7 +9246,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Activating Audio ICE\n");
 
-			switch_rtp_activate_ice(a_engine->rtp_session,
+			switch_rtp_activate_ice_v2(a_engine->rtp_session,
 									a_engine->ice_in.ufrag,
 									a_engine->ice_out.ufrag,
 									a_engine->ice_out.pwd,
@@ -8870,12 +9254,29 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 									IPR_RTP,
 #ifdef GOOGLE_ICE
 									ICE_GOOGLE_JINGLE,
-									NULL
+									NULL, NULL
 #else
 									switch_determine_ice_type(a_engine, session),
-									&a_engine->ice_in
+									&a_engine->ice_in, &a_engine->ice_out
 #endif
 									);
+
+				/* Media dual-stack: we advertised a second-family host candidate above
+				   (gen_ice, audio only); bind a receive socket for it (same port, other family)
+				   so a dual-stack peer can actually use it. Inside the ICE-active guard so it
+				   is genuinely tied to the candidate advertisement. */
+				if (!zstr(smh->mparams->rtpip4) && !zstr(smh->mparams->rtpip6) && !zstr(a_engine->local_sdp_ip)) {
+					const char *alt_ip = strchr(a_engine->local_sdp_ip, ':') ? smh->mparams->rtpip4 : smh->mparams->rtpip6;
+
+					if (!zstr(alt_ip) && strcmp(alt_ip, a_engine->local_sdp_ip)) {
+						const char *derr = NULL;
+						if (switch_rtp_enable_dual_recv(a_engine->rtp_session, alt_ip, a_engine->local_sdp_port, &derr) == SWITCH_STATUS_SUCCESS) {
+							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Media dual-stack: also receiving on %s:%d\n", alt_ip, a_engine->local_sdp_port);
+						} else {
+							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "Media dual-stack: second-family receive socket not enabled: %s\n", derr ? derr : "unknown");
+						}
+					}
+				}
 
 
 
@@ -8915,7 +9316,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 				} else {
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Activating RTCP ICE\n");
 
-					switch_rtp_activate_ice(a_engine->rtp_session,
+					switch_rtp_activate_ice_v2(a_engine->rtp_session,
 											a_engine->ice_in.ufrag,
 											a_engine->ice_out.ufrag,
 											a_engine->ice_out.pwd,
@@ -8923,10 +9324,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 											IPR_RTCP,
 #ifdef GOOGLE_ICE
 											ICE_GOOGLE_JINGLE,
-											NULL
+											NULL, NULL
 #else
 											switch_determine_ice_type(a_engine, session),
-											&a_engine->ice_in
+											&a_engine->ice_in, &a_engine->ice_out
 #endif
 										);
 				}
@@ -9223,7 +9624,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Activating Text ICE\n");
 
-					switch_rtp_activate_ice(t_engine->rtp_session,
+					switch_rtp_activate_ice_v2(t_engine->rtp_session,
 											t_engine->ice_in.ufrag,
 											t_engine->ice_out.ufrag,
 											t_engine->ice_out.pwd,
@@ -9231,10 +9632,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 											IPR_RTP,
 #ifdef GOOGLE_ICE
 											ICE_GOOGLE_JINGLE,
-											NULL
+											NULL, NULL
 #else
 											switch_determine_ice_type(t_engine, session),
-											&t_engine->ice_in
+											&t_engine->ice_in, &t_engine->ice_out
 #endif
 											);
 
@@ -9274,7 +9675,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Skipping TEXT RTCP ICE (Same as TEXT RTP)\n");
 						} else {
 							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Activating TEXT RTCP ICE\n");
-							switch_rtp_activate_ice(t_engine->rtp_session,
+							switch_rtp_activate_ice_v2(t_engine->rtp_session,
 													t_engine->ice_in.ufrag,
 													t_engine->ice_out.ufrag,
 													t_engine->ice_out.pwd,
@@ -9282,10 +9683,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 													IPR_RTCP,
 #ifdef GOOGLE_ICE
 													ICE_GOOGLE_JINGLE,
-													NULL
+													NULL, NULL
 #else
 													switch_determine_ice_type(t_engine, session),
-													&t_engine->ice_in
+													&t_engine->ice_in, &t_engine->ice_out
 #endif
 													);
 
@@ -9544,7 +9945,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Activating Video ICE\n");
 
-					switch_rtp_activate_ice(v_engine->rtp_session,
+					switch_rtp_activate_ice_v2(v_engine->rtp_session,
 											v_engine->ice_in.ufrag,
 											v_engine->ice_out.ufrag,
 											v_engine->ice_out.pwd,
@@ -9552,10 +9953,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 											IPR_RTP,
 #ifdef GOOGLE_ICE
 											ICE_GOOGLE_JINGLE,
-											NULL
+											NULL, NULL
 #else
 											switch_determine_ice_type(v_engine, session),
-											&v_engine->ice_in
+											&v_engine->ice_in, &v_engine->ice_out
 #endif
 											);
 
@@ -9596,7 +9997,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 						} else {
 
 							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Activating VIDEO RTCP ICE\n");
-							switch_rtp_activate_ice(v_engine->rtp_session,
+							switch_rtp_activate_ice_v2(v_engine->rtp_session,
 													v_engine->ice_in.ufrag,
 													v_engine->ice_out.ufrag,
 													v_engine->ice_out.pwd,
@@ -9604,10 +10005,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_activate_rtp(switch_core_sessi
 													IPR_RTCP,
 #ifdef GOOGLE_ICE
 													ICE_GOOGLE_JINGLE,
-													NULL
+													NULL, NULL
 #else
 													switch_determine_ice_type(v_engine, session),
-													&v_engine->ice_in
+													&v_engine->ice_in, &v_engine->ice_out
 #endif
 													);
 
@@ -9741,6 +10142,113 @@ static char *get_setup(switch_rtp_engine_t *engine, switch_core_session_t *sessi
 }
 
 
+/* Emit the ICE a=candidate lines for ONE local candidate (component 1, plus
+   component 2 when RTCP is not muxed). The host line is family-agnostic - it just
+   prints con_addr, which is exactly why the existing single-candidate code already
+   produced valid v6 output in v6-only deployments. The reflexive candidates
+   (external/local srflx) are tied to a per-family public IP (extsipip / local_sdp_ip),
+   so they are only attached to the host whose family matches; otherwise a v4 srflx
+   would be stapled onto a v6 host. This is the former inline emission generalized to
+   run per local candidate for media dual-stack; single-family output is unchanged
+   (with RTCP-mux, which WebRTC always uses, byte-identical). */
+static void emit_ice_cand_lines(char *buf, size_t buflen, switch_media_handle_t *smh,
+								switch_rtp_engine_t *engine, ice_t *ice_out, int k,
+								int external_candidate_priority, int external_candidate_srflx,
+								int include_external, int emit_comp2, int family_priority)
+{
+	icand_t *cand = &ice_out->cands[k][0];
+	char tmp1[11] = "";
+	char tmp2[11] = "";
+	char tmp3[11] = "";
+	int cand_v6, ext_v6, lsrflx_v6, dual, fam_prio_dec, emit_external, external_srflx_dup, emit_local_srflx;
+	int off = (engine->rtcp_mux > 0 ? 0 : 1);
+
+	if (!cand->ready || zstr(cand->con_addr)) {
+		return;
+	}
+
+	tmp1[10] = '\0';
+	tmp2[10] = '\0';
+	tmp3[10] = '\0';
+	switch_stun_random_string(tmp1, 10, "0123456789");
+	switch_stun_random_string(tmp2, 10, "0123456789");
+	switch_stun_random_string(tmp3, 10, "0123456789");
+
+	cand_v6 = strchr(cand->con_addr, ':') ? 1 : 0;
+	ext_v6 = (!zstr(smh->mparams->extsipip) && strchr(smh->mparams->extsipip, ':')) ? 1 : 0;
+	lsrflx_v6 = (!zstr(engine->local_sdp_ip) && strchr(engine->local_sdp_ip, ':')) ? 1 : 0;
+
+	/* Priority decrement is dual-stack only: RFC 8421 / RFC 6724 prefer IPv6, so under dual-stack
+	   the v4 host is stepped down one local-preference unit (RFC 8445 5.1.2.2 also requires
+	   same-type candidates to differ). In single-stack there is nothing to order, so no decrement
+	   and the host line stays byte-identical to the pre-feature single-family baseline.
+
+	   The reflexive/external family match applies ALWAYS (single- and dual-stack): a reflexive
+	   candidate is tied to a per-family public IP (extsipip / local_sdp_ip) and is attached only
+	   to the host of its own family, so a v4 srflx is never stapled onto a v6 host (or vice versa).
+	   For the common v4-only config (v4 extsipip) this stays byte-identical (families match); it
+	   also fixes a v6-only config with a v4 extsipip, which previously emitted a nonsensical
+	   v4-srflx-with-v6-raddr candidate. */
+	dual = !zstr(smh->mparams->rtpip4) && !zstr(smh->mparams->rtpip6);
+	fam_prio_dec = dual ? ice_family_prio_dec(cand_v6, family_priority) : 0;
+
+	emit_external = include_external && !zstr(smh->mparams->extsipip) && (ext_v6 == cand_v6);
+	external_srflx_dup = emit_external && external_candidate_srflx && !strcmp(smh->mparams->extsipip, cand->con_addr);
+	emit_local_srflx = !zstr(engine->local_sdp_ip) && strcmp(engine->local_sdp_ip, cand->con_addr)
+					   && engine->local_sdp_port != cand->con_port && (lsrflx_v6 == cand_v6);
+
+	switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ host generation 0\r\n",
+					tmp1, cand->transport, calc_candidate_priority_host(1, external_candidate_priority) - fam_prio_dec,
+					cand->con_addr, cand->con_port);
+
+	if (emit_external) {
+		if (external_candidate_srflx) {
+			if (!external_srflx_dup) {
+				switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ srflx raddr %s rport %d generation 0\r\n",
+								tmp3, cand->transport, calc_candidate_priority_srflx(1, external_candidate_priority, external_candidate_srflx, 1),
+								smh->mparams->extsipip, cand->con_port, cand->con_addr, cand->con_port);
+			}
+		} else {
+			switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ host generation 0\r\n",
+							tmp3, cand->transport, calc_candidate_priority_external(1, external_candidate_priority),
+							smh->mparams->extsipip, cand->con_port);
+		}
+	}
+
+	if (emit_local_srflx) {
+		switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ srflx raddr %s rport %d generation 0\r\n",
+						tmp2, cand->transport, calc_candidate_priority_srflx(1, external_candidate_priority, external_candidate_srflx, 0),
+						cand->con_addr, cand->con_port, engine->local_sdp_ip, engine->local_sdp_port);
+	}
+
+	if (emit_comp2) {
+		switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ host generation 0\r\n",
+						tmp1, cand->transport, calc_candidate_priority_host(2, external_candidate_priority) - fam_prio_dec,
+						cand->con_addr, cand->con_port + off);
+
+		if (emit_external) {
+			if (external_candidate_srflx) {
+				if (!external_srflx_dup) {
+					switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ srflx raddr %s rport %d generation 0\r\n",
+									tmp3, cand->transport, calc_candidate_priority_srflx(2, external_candidate_priority, external_candidate_srflx, 1),
+									smh->mparams->extsipip, cand->con_port + off, cand->con_addr, cand->con_port + off);
+				}
+			} else {
+				switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ host generation 0\r\n",
+								tmp3, cand->transport, calc_candidate_priority_external(2, external_candidate_priority),
+								smh->mparams->extsipip, cand->con_port + off);
+			}
+		}
+
+		if (emit_local_srflx) {
+			switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ srflx raddr %s rport %d generation 0\r\n",
+							tmp2, cand->transport, calc_candidate_priority_srflx(2, external_candidate_priority, external_candidate_srflx, 0),
+							cand->con_addr, cand->con_port + off, engine->local_sdp_ip, engine->local_sdp_port + off);
+		}
+	}
+}
+
+
 //?
 static void generate_m(switch_core_session_t *session, char *buf, size_t buflen,
 					   switch_port_t port, const char *family, const char *ip,
@@ -9754,6 +10262,8 @@ static void generate_m(switch_core_session_t *session, char *buf, size_t buflen,
 	switch_media_handle_t *smh;
 	switch_rtp_engine_t *a_engine;
 	int include_external;
+	int external_candidate_priority = 0; // 0: same priority for all candidates (not allowed according to RFC 8445), -1: host higher, 1: external higher, 2: srflx/external higher
+	int external_candidate_srflx = 0;	 // 0: external candidate is host type, 1: external candidate is srflx type
 	switch_core_media_avp_secure_t avp_secure = AVP_NO_SECURE;
 
 	switch_assert(session);
@@ -9785,6 +10295,8 @@ static void generate_m(switch_core_session_t *session, char *buf, size_t buflen,
 					get_media_profile_name(session, secure || a_engine->crypto_type != CRYPTO_INVALID, avp_secure));
 
 	include_external = switch_channel_var_true(session->channel, "include_external_ip");
+	external_candidate_srflx = switch_channel_var_true(session->channel, "external_candidate_srflx");
+	external_candidate_priority = get_external_candidate_priority(session);
 
 	for (i = 0; i < smh->mparams->num_codecs; i++) {
 		const switch_codec_implementation_t *imp = smh->codecs[i];
@@ -9981,19 +10493,8 @@ static void generate_m(switch_core_session_t *session, char *buf, size_t buflen,
 	//switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=ssrc:%u\r\n", a_engine->ssrc);
 
 	if (a_engine->ice_out.cands[0][0].ready) {
-		char tmp1[11] = "";
-		char tmp2[11] = "";
-		char tmp3[11] = "";
-		uint32_t c1 = (1<<24)*126 + (1<<8)*65535 + (1<<0)*(256 - 1);
-		uint32_t c2 = c1 - 1;
 		ice_t *ice_out;
-
-		tmp1[10] = '\0';
-		tmp2[10] = '\0';
-		tmp3[10] = '\0';
-		switch_stun_random_string(tmp1, 10, "0123456789");
-		switch_stun_random_string(tmp2, 10, "0123456789");
-		switch_stun_random_string(tmp3, 10, "0123456789");
+		int k, emit_comp2, family_priority;
 
 		gen_ice(session, SWITCH_MEDIA_TYPE_AUDIO, NULL, 0);
 
@@ -10004,59 +10505,14 @@ static void generate_m(switch_core_session_t *session, char *buf, size_t buflen,
 		switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=ssrc:%u mslabel:%s\r\n", a_engine->ssrc, smh->msid);
 		switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=ssrc:%u label:%sa0\r\n", a_engine->ssrc, smh->msid);
 
-
 		switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=ice-ufrag:%s\r\n", ice_out->ufrag);
 		switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=ice-pwd:%s\r\n", ice_out->pwd);
 
+		emit_comp2 = (a_engine->rtcp_mux < 1 || switch_channel_direction(session->channel) == SWITCH_CALL_DIRECTION_OUTBOUND || switch_channel_test_flag(session->channel, CF_RECOVERING));
+		family_priority = get_ice_family_priority(session);
 
-		switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ host generation 0\r\n",
-						tmp1, ice_out->cands[0][0].transport, c1,
-						ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port
-						);
-
-		if (include_external && !zstr(smh->mparams->extsipip)) {
-			switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ host generation 0\r\n",
-				tmp3, ice_out->cands[0][0].transport, c1,
-				smh->mparams->extsipip, ice_out->cands[0][0].con_port
-				);
-		}
-
-		if (!zstr(a_engine->local_sdp_ip) && !zstr(ice_out->cands[0][0].con_addr) && 
-			strcmp(a_engine->local_sdp_ip, ice_out->cands[0][0].con_addr)
-			&& a_engine->local_sdp_port != ice_out->cands[0][0].con_port) {
-
-			switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ srflx raddr %s rport %d generation 0\r\n",
-							tmp2, ice_out->cands[0][0].transport, c2,
-							ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port,
-							a_engine->local_sdp_ip, a_engine->local_sdp_port
-							);
-		}
-
-		if (a_engine->rtcp_mux < 1 || switch_channel_direction(session->channel) == SWITCH_CALL_DIRECTION_OUTBOUND || switch_channel_test_flag(session->channel, CF_RECOVERING)) {
-
-
-			switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ host generation 0\r\n",
-							tmp1, ice_out->cands[0][0].transport, c1,
-							ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port + (a_engine->rtcp_mux > 0 ? 0 : 1)
-							);
-			
-			if (include_external && !zstr(smh->mparams->extsipip)) {
-				switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ host generation 0\r\n",
-					tmp3, ice_out->cands[0][0].transport, c1,
-					smh->mparams->extsipip, ice_out->cands[0][0].con_port
-					);
-			}
-
-			if (!zstr(a_engine->local_sdp_ip) && !zstr(ice_out->cands[0][1].con_addr) && 
-				strcmp(a_engine->local_sdp_ip, ice_out->cands[0][1].con_addr)
-				&& a_engine->local_sdp_port != ice_out->cands[0][1].con_port) {
-
-				switch_snprintf(buf + strlen(buf), buflen - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ srflx raddr %s rport %d generation 0\r\n",
-								tmp2, ice_out->cands[0][0].transport, c2,
-								ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port + (a_engine->rtcp_mux > 0 ? 0 : 1),
-								a_engine->local_sdp_ip, a_engine->local_sdp_port + (a_engine->rtcp_mux > 0 ? 0 : 1)
-								);
-			}
+		for (k = 0; k < MAX_CAND && ice_out->cands[k][0].ready; k++) {
+			emit_ice_cand_lines(buf, buflen, smh, a_engine, ice_out, k, external_candidate_priority, external_candidate_srflx, include_external, emit_comp2, family_priority);
 		}
 
 
@@ -10266,6 +10722,8 @@ SWITCH_DECLARE(void) switch_core_media_gen_local_sdp(switch_core_session_t *sess
 	uint8_t fir = 0, nack = 0, pli = 0, tmmbr = 0, has_vid = 0;
 	const char *use_rtcp_mux = NULL;
 	int include_external;
+	int external_candidate_priority = 0; // 0: same priority for all candidates (not allowed according to RFC 8445), -1: host higher, 1: external higher, 2: srflx/external higher
+	int external_candidate_srflx = 0;    // 0: external candidate is host type, 1: external candidate is srflx type
 
 	switch_assert(session);
 
@@ -10278,6 +10736,8 @@ SWITCH_DECLARE(void) switch_core_media_gen_local_sdp(switch_core_session_t *sess
 	t_engine = &smh->engines[SWITCH_MEDIA_TYPE_TEXT];
 
 	include_external = switch_channel_var_true(session->channel, "include_external_ip");
+	external_candidate_srflx = switch_channel_var_true(session->channel, "external_candidate_srflx");
+	external_candidate_priority = get_external_candidate_priority(session);
 
 	use_rtcp_mux = switch_channel_get_variable(session->channel, "rtcp_mux");
 
@@ -10712,78 +11172,18 @@ SWITCH_DECLARE(void) switch_core_media_gen_local_sdp(switch_core_session_t *sess
 		//switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=ssrc:%u\r\n", a_engine->ssrc);
 
 		if (a_engine->ice_out.cands[0][0].ready) {
-			char tmp1[11] = "";
-			char tmp2[11] = "";
-			char tmp3[11] = "";
-			uint32_t c1 = (1<<24)*126 + (1<<8)*65535 + (1<<0)*(256 - 1);
-			uint32_t c2 = c1 - 1;
-			uint32_t c3 = c1 - 2;
-			uint32_t c4 = c1 - 3;
-
-			tmp1[10] = '\0';
-			tmp2[10] = '\0';
-			tmp3[10] = '\0';
-			switch_stun_random_string(tmp1, 10, "0123456789");
-			switch_stun_random_string(tmp2, 10, "0123456789");
-			switch_stun_random_string(tmp3, 10, "0123456789");
+			int k, emit_comp2, family_priority;
 
 			ice_out = &a_engine->ice_out;
-
 
 			switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=ice-ufrag:%s\r\n", ice_out->ufrag);
 			switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=ice-pwd:%s\r\n", ice_out->pwd);
 
+			emit_comp2 = (a_engine->rtcp_mux < 1 || is_outbound || switch_channel_test_flag(session->channel, CF_RECOVERING));
+			family_priority = get_ice_family_priority(session);
 
-			switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ host generation 0\r\n",
-							tmp1, ice_out->cands[0][0].transport, c1,
-							ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port
-							);
-
-			if (include_external && !zstr(smh->mparams->extsipip)) {
-				switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ host generation 0\r\n",
-					tmp3, ice_out->cands[0][0].transport, c1,
-					smh->mparams->extsipip, ice_out->cands[0][0].con_port
-					);
-			}
-
-			if (!zstr(a_engine->local_sdp_ip) && !zstr(ice_out->cands[0][0].con_addr) && 
-				strcmp(a_engine->local_sdp_ip, ice_out->cands[0][0].con_addr)
-				&& a_engine->local_sdp_port != ice_out->cands[0][0].con_port) {
-
-				switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ srflx raddr %s rport %d generation 0\r\n",
-								tmp2, ice_out->cands[0][0].transport, c3,
-								ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port,
-								a_engine->local_sdp_ip, a_engine->local_sdp_port
-								);
-			}
-
-
-			if (a_engine->rtcp_mux < 1 || is_outbound || switch_channel_test_flag(session->channel, CF_RECOVERING)) {
-
-				switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ host generation 0\r\n",
-								tmp1, ice_out->cands[0][0].transport, c2,
-								ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port + (a_engine->rtcp_mux > 0 ? 0 : 1)
-								);
-
-				if (include_external && !zstr(smh->mparams->extsipip)) {
-					switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ host generation 0\r\n",
-						tmp3, ice_out->cands[0][0].transport, c2,
-						smh->mparams->extsipip, ice_out->cands[0][0].con_port + (a_engine->rtcp_mux > 0 ? 0 : 1)
-						);
-				}
-
-
-
-				if (!zstr(a_engine->local_sdp_ip) && !zstr(ice_out->cands[0][0].con_addr) &&
-					strcmp(a_engine->local_sdp_ip, ice_out->cands[0][0].con_addr)
-					&& a_engine->local_sdp_port != ice_out->cands[0][0].con_port) {
-
-					switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ srflx raddr %s rport %d generation 0\r\n",
-									tmp2, ice_out->cands[0][0].transport, c4,
-									ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port + (a_engine->rtcp_mux > 0 ? 0 : 1),
-									a_engine->local_sdp_ip, a_engine->local_sdp_port + (a_engine->rtcp_mux > 0 ? 0 : 1)
-									);
-				}
+			for (k = 0; k < MAX_CAND && ice_out->cands[k][0].ready; k++) {
+				emit_ice_cand_lines(buf, SDPBUFLEN, smh, a_engine, ice_out, k, external_candidate_priority, external_candidate_srflx, include_external, emit_comp2, family_priority);
 			}
 
 			switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=end-of-candidates\r\n");
@@ -11261,10 +11661,12 @@ SWITCH_DECLARE(void) switch_core_media_gen_local_sdp(switch_core_session_t *sess
 					char tmp1[11] = "";
 					char tmp2[11] = "";
 					char tmp3[11] = "";
-					uint32_t c1 = (1<<24)*126 + (1<<8)*65535 + (1<<0)*(256 - 1);
-					uint32_t c2 = c1 - 1;
-					uint32_t c3 = c1 - 2;
-					uint32_t c4 = c1 - 3;
+					//uint32_t c1 = (1<<24)*126 + (1<<8)*65535 + (1<<0)*(256 - 1);
+					//uint32_t c2 = c1 - 1;
+					//uint32_t c3 = c1 - 2;
+					//uint32_t c4 = c1 - 3;
+					/* ICE candidate emission predicates - see generate_m for the rationale. */
+					int emit_external, external_srflx_dup, emit_local_srflx;
 
 					tmp1[10] = '\0';
 					tmp2[10] = '\0';
@@ -11274,6 +11676,10 @@ SWITCH_DECLARE(void) switch_core_media_gen_local_sdp(switch_core_session_t *sess
 					switch_stun_random_string(tmp3, 10, "0123456789");
 
 					ice_out = &v_engine->ice_out;
+
+					emit_external = include_external && !zstr(smh->mparams->extsipip);
+					external_srflx_dup = emit_external && external_candidate_srflx && !zstr(ice_out->cands[0][0].con_addr) && !strcmp(smh->mparams->extsipip, ice_out->cands[0][0].con_addr);
+					emit_local_srflx = !zstr(v_engine->local_sdp_ip) && !zstr(ice_out->cands[0][0].con_addr) && strcmp(v_engine->local_sdp_ip, ice_out->cands[0][0].con_addr) && v_engine->local_sdp_port != ice_out->cands[0][0].con_port;
 
 
 					switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=ssrc:%u cname:%s\r\n", v_engine->ssrc, smh->cname);
@@ -11288,23 +11694,32 @@ SWITCH_DECLARE(void) switch_core_media_gen_local_sdp(switch_core_session_t *sess
 
 
 					switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ host generation 0\r\n",
-									tmp1, ice_out->cands[0][0].transport, c1,
+									tmp1, ice_out->cands[0][0].transport, calc_candidate_priority_host(1, external_candidate_priority),
 									ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port
 									);
 
-					if (include_external && !zstr(smh->mparams->extsipip)) {
-						switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ host generation 0\r\n",
-							tmp3, ice_out->cands[0][0].transport, c1,
-							smh->mparams->extsipip, ice_out->cands[0][0].con_port
-							);
+					if (emit_external) {
+						if (external_candidate_srflx) {
+							if (!external_srflx_dup) {
+								switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ srflx raddr %s rport %d generation 0\r\n",
+									tmp3, ice_out->cands[0][0].transport, calc_candidate_priority_srflx(1, external_candidate_priority, external_candidate_srflx, 1),
+									smh->mparams->extsipip, ice_out->cands[0][0].con_port,
+									ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port
+									);
+							}
+						}
+						else {
+							switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ host generation 0\r\n",
+								tmp3, ice_out->cands[0][0].transport, calc_candidate_priority_external(1, external_candidate_priority),
+								smh->mparams->extsipip, ice_out->cands[0][0].con_port
+								);
+						}
 					}
 
-					if (!zstr(v_engine->local_sdp_ip) && !zstr(ice_out->cands[0][0].con_addr) && 
-						strcmp(v_engine->local_sdp_ip, ice_out->cands[0][0].con_addr)
-						&& v_engine->local_sdp_port != ice_out->cands[0][0].con_port) {
+					if (emit_local_srflx) {
 
 						switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ srflx raddr %s rport %d generation 0\r\n",
-										tmp2, ice_out->cands[0][0].transport, c3,
+										tmp2, ice_out->cands[0][0].transport, calc_candidate_priority_srflx(1, external_candidate_priority, external_candidate_srflx, 0),
 										ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port,
 										v_engine->local_sdp_ip, v_engine->local_sdp_port
 										);
@@ -11314,24 +11729,33 @@ SWITCH_DECLARE(void) switch_core_media_gen_local_sdp(switch_core_session_t *sess
 					if (v_engine->rtcp_mux < 1 || is_outbound || switch_channel_test_flag(session->channel, CF_RECOVERING)) {
 
 						switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ host generation 0\r\n",
-										tmp1, ice_out->cands[0][0].transport, c2,
+										tmp1, ice_out->cands[0][0].transport, calc_candidate_priority_host(2, external_candidate_priority),
 										ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port + (v_engine->rtcp_mux > 0 ? 0 : 1)
 										);
 
-					if (include_external && !zstr(smh->mparams->extsipip)) {
-							switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ host generation 0\r\n",
-								tmp3, ice_out->cands[0][0].transport, c2,
-								smh->mparams->extsipip, ice_out->cands[0][0].con_port + (v_engine->rtcp_mux > 0 ? 0 : 1)
-								);
+						if (emit_external) {
+							if (external_candidate_srflx) {
+								if (!external_srflx_dup) {
+									switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ srflx raddr %s rport %d generation 0\r\n",
+										tmp3, ice_out->cands[0][0].transport, calc_candidate_priority_srflx(2, external_candidate_priority, external_candidate_srflx, 1),
+										smh->mparams->extsipip, ice_out->cands[0][0].con_port + (v_engine->rtcp_mux > 0 ? 0 : 1),
+										ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port + (v_engine->rtcp_mux > 0 ? 0 : 1)
+										);
+								}
+							}
+							else {
+								switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ host generation 0\r\n",
+									tmp3, ice_out->cands[0][0].transport, calc_candidate_priority_external(2, external_candidate_priority),
+									smh->mparams->extsipip, ice_out->cands[0][0].con_port + (v_engine->rtcp_mux > 0 ? 0 : 1)
+									);
+							}
 						}
 
 
-						if (!zstr(v_engine->local_sdp_ip) && !zstr(ice_out->cands[0][1].con_addr) && 
-							strcmp(v_engine->local_sdp_ip, ice_out->cands[0][1].con_addr)
-							&& v_engine->local_sdp_port != ice_out->cands[0][1].con_port) {
+						if (emit_local_srflx) {
 
 							switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ srflx generation 0\r\n",
-											tmp2, ice_out->cands[0][0].transport, c4,
+											tmp2, ice_out->cands[0][0].transport, calc_candidate_priority_srflx(2, external_candidate_priority, external_candidate_srflx, 0),
 											ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port + (v_engine->rtcp_mux > 0 ? 0 : 1),
 											v_engine->local_sdp_ip, v_engine->local_sdp_port + (v_engine->rtcp_mux > 0 ? 0 : 1)
 											);
@@ -11620,10 +12044,11 @@ SWITCH_DECLARE(void) switch_core_media_gen_local_sdp(switch_core_session_t *sess
 				if (t_engine->ice_out.cands[0][0].ready) {
 					char tmp1[11] = "";
 					char tmp2[11] = "";
-					uint32_t c1 = (1<<24)*126 + (1<<8)*65535 + (1<<0)*(256 - 1);
-					uint32_t c2 = c1 - 1;
-					uint32_t c3 = c1 - 2;
-					uint32_t c4 = c1 - 3;
+					int emit_local_srflx;
+					//uint32_t c1 = (1<<24)*126 + (1<<8)*65535 + (1<<0)*(256 - 1);
+					//uint32_t c2 = c1 - 1;
+					//uint32_t c3 = c1 - 2;
+					//uint32_t c4 = c1 - 3;
 
 					tmp1[10] = '\0';
 					tmp2[10] = '\0';
@@ -11631,6 +12056,9 @@ SWITCH_DECLARE(void) switch_core_media_gen_local_sdp(switch_core_session_t *sess
 					switch_stun_random_string(tmp2, 10, "0123456789");
 
 					ice_out = &t_engine->ice_out;
+
+				/* ICE candidate emission predicate - see generate_m; text emits no external candidate. */
+				emit_local_srflx = !zstr(t_engine->local_sdp_ip) && !zstr(ice_out->cands[0][0].con_addr) && strcmp(t_engine->local_sdp_ip, ice_out->cands[0][0].con_addr) && t_engine->local_sdp_port != ice_out->cands[0][0].con_port;
 
 
 					switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=ssrc:%u cname:%s\r\n", t_engine->ssrc, smh->cname);
@@ -11645,16 +12073,14 @@ SWITCH_DECLARE(void) switch_core_media_gen_local_sdp(switch_core_session_t *sess
 
 
 					switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ host generation 0\r\n",
-									tmp1, ice_out->cands[0][0].transport, c1,
+									tmp1, ice_out->cands[0][0].transport, calc_candidate_priority_host(1, external_candidate_priority),
 									ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port
 									);
 
-					if (!zstr(t_engine->local_sdp_ip) && !zstr(ice_out->cands[0][0].con_addr) &&
-						strcmp(t_engine->local_sdp_ip, ice_out->cands[0][0].con_addr)
-						&& t_engine->local_sdp_port != ice_out->cands[0][0].con_port) {
+					if (emit_local_srflx) {
 
 						switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 1 %s %u %s %d typ srflx raddr %s rport %d generation 0\r\n",
-										tmp2, ice_out->cands[0][0].transport, c3,
+										tmp2, ice_out->cands[0][0].transport, calc_candidate_priority_srflx(1, external_candidate_priority, external_candidate_srflx, 0),
 										ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port,
 										t_engine->local_sdp_ip, t_engine->local_sdp_port
 										);
@@ -11664,17 +12090,15 @@ SWITCH_DECLARE(void) switch_core_media_gen_local_sdp(switch_core_session_t *sess
 					if (t_engine->rtcp_mux < 1 || is_outbound || switch_channel_test_flag(session->channel, CF_RECOVERING)) {
 
 						switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ host generation 0\r\n",
-										tmp1, ice_out->cands[0][0].transport, c2,
+										tmp1, ice_out->cands[0][0].transport, calc_candidate_priority_host(2, external_candidate_priority),
 										ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port + (t_engine->rtcp_mux > 0 ? 0 : 1)
 										);
 
 
-						if (!zstr(t_engine->local_sdp_ip) && !zstr(ice_out->cands[0][1].con_addr) &&
-							strcmp(t_engine->local_sdp_ip, ice_out->cands[0][1].con_addr)
-							&& t_engine->local_sdp_port != ice_out->cands[0][1].con_port) {
+						if (emit_local_srflx) {
 
 							switch_snprintf(buf + strlen(buf), SDPBUFLEN - strlen(buf), "a=candidate:%s 2 %s %u %s %d typ srflx generation 0\r\n",
-											tmp2, ice_out->cands[0][0].transport, c4,
+											tmp2, ice_out->cands[0][0].transport, calc_candidate_priority_srflx(2, external_candidate_priority, external_candidate_srflx, 0),
 											ice_out->cands[0][0].con_addr, ice_out->cands[0][0].con_port + (t_engine->rtcp_mux > 0 ? 0 : 1),
 											t_engine->local_sdp_ip, t_engine->local_sdp_port + (t_engine->rtcp_mux > 0 ? 0 : 1)
 											);
@@ -13402,6 +13826,40 @@ SWITCH_DECLARE(switch_rtp_stats_t *) switch_core_media_get_stats(switch_core_ses
 	return NULL;
 }
 
+SWITCH_DECLARE(switch_bool_t) switch_core_media_has_ice(switch_core_session_t *session, switch_media_type_t type, ice_proto_t proto)
+{
+	switch_media_handle_t *smh;
+
+	switch_assert(session);
+
+	if (!(smh = session->media_handle)) {
+		return SWITCH_FALSE;
+	}
+
+	if (smh->engines[type].rtp_session) {
+		return switch_rtp_has_ice(smh->engines[type].rtp_session, proto);
+	}
+
+	return SWITCH_FALSE;
+}
+
+SWITCH_DECLARE(switch_status_t) switch_core_media_get_ice_snapshot(switch_core_session_t *session, switch_media_type_t type, ice_proto_t proto, switch_rtp_ice_snapshot_t *snapshot)
+{
+	switch_media_handle_t *smh;
+
+	switch_assert(session);
+
+	if (!(smh = session->media_handle)) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	if (smh->engines[type].rtp_session) {
+		return switch_rtp_get_ice_snapshot(smh->engines[type].rtp_session, proto, snapshot);
+	}
+
+	return SWITCH_STATUS_FALSE;
+}
+
 //?
 SWITCH_DECLARE(switch_bool_t) switch_core_media_check_udptl_mode(switch_core_session_t *session, switch_media_type_t type)
 {
@@ -13906,21 +14364,33 @@ SWITCH_DECLARE(void) switch_core_session_stop_media(switch_core_session_t *sessi
 
 	smh->msid = NULL;
 	smh->cname = NULL;
+
+	/* Reset each engine's outgoing ICE params under its own ice_mutex so the media thread
+	   does not read half-cleared ice_out via ice_params_out; also clear ready so a snapshot
+	   cannot copy a candidate with a NULL foundation after the reset. */
+	switch_rtp_ice_lock(v_engine->rtp_session);
 	v_engine->ice_out.ufrag = NULL;
 	v_engine->ice_out.pwd = NULL;
 	v_engine->ice_out.cands[0][0].foundation = NULL;
 	v_engine->ice_out.cands[0][0].component_id = 0;
+	v_engine->ice_out.cands[0][0].ready = 0;
+	switch_rtp_ice_unlock(v_engine->rtp_session);
 
+	switch_rtp_ice_lock(t_engine->rtp_session);
 	t_engine->ice_out.ufrag = NULL;
 	t_engine->ice_out.pwd = NULL;
 	t_engine->ice_out.cands[0][0].foundation = NULL;
 	t_engine->ice_out.cands[0][0].component_id = 0;
+	t_engine->ice_out.cands[0][0].ready = 0;
+	switch_rtp_ice_unlock(t_engine->rtp_session);
 
-
+	switch_rtp_ice_lock(a_engine->rtp_session);
 	a_engine->ice_out.ufrag = NULL;
 	a_engine->ice_out.pwd = NULL;
 	a_engine->ice_out.cands[0][0].foundation = NULL;
 	a_engine->ice_out.cands[0][0].component_id = 0;
+	a_engine->ice_out.cands[0][0].ready = 0;
+	switch_rtp_ice_unlock(a_engine->rtp_session);
 
 	if (v_engine->ice_in.cands[v_engine->ice_in.chosen[0]][0].ready) {
 		gen_ice(smh->session, SWITCH_MEDIA_TYPE_VIDEO, NULL, 0);

@@ -254,6 +254,7 @@ typedef struct {
 	switch_time_t next_run;
 	switch_core_media_ice_type_t type;
 	ice_t *ice_params;
+	ice_t *ice_params_out;
 	ice_proto_t proto;
 	uint8_t sending;
 	uint8_t ready;
@@ -264,6 +265,8 @@ typedef struct {
 	switch_time_t last_ok;
 	uint8_t cand_responsive;
 	uint8_t verify_integrity;
+	uint64_t tiebreaker;
+	uint16_t remote_role;   /* peer ICE role (SWITCH_STUN_ATTR_CONTROLLED/CONTROLLING, 0=unknown); fills the role missing from role-less 487 responses */
 } switch_rtp_ice_t;
 
 struct switch_rtp;
@@ -375,6 +378,14 @@ struct switch_rtp {
 	switch_pollfd_t *jb_pollfd;
 
 	switch_sockaddr_t *local_addr, *rtcp_local_addr;
+	/* Media dual-stack: a second receive socket bound to the other media family at the
+	   same port (the alt host candidate advertised by gen_ice). NULL unless dual-stack is
+	   active (audio + both rtpip4/rtpip6). Runs in parallel to sock_input; the read path
+	   polls both, and the send path uses whichever bound socket matches the remote family. */
+	switch_socket_t *sock_input_2;
+	switch_pollfd_t *read_pollfd_dual;   /* contiguous 2-element pollset [sock_input, sock_input_2] */
+	switch_sockaddr_t *local_addr_2;
+	dtls_state_t cng_log_state;   /* last DTLS state logged for the CNG-during-handshake notice; de-spams the per-frame log */
 	rtp_msg_t send_msg;
 	rtcp_msg_t rtcp_send_msg;
 	switch_rtcp_frame_t rtcp_frame;
@@ -594,14 +605,14 @@ static void do_2833(switch_rtp_t *rtp_session);
 
 
 #define rtp_type(rtp_session) rtp_session->flags[SWITCH_RTP_FLAG_TEXT] ?  "text" : (rtp_session->flags[SWITCH_RTP_FLAG_VIDEO] ? "video" : "audio")
+#define rtp_media_type(rtp_session) rtp_session->flags[SWITCH_RTP_FLAG_TEXT] ?  SWITCH_MEDIA_TYPE_TEXT : (rtp_session->flags[SWITCH_RTP_FLAG_VIDEO] ? SWITCH_MEDIA_TYPE_VIDEO : SWITCH_MEDIA_TYPE_AUDIO)
 
-
-static void switch_rtp_change_ice_dest(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, const char *host, switch_port_t port)
+static void switch_rtp_ice_change_dest(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, const char *host, switch_port_t port)
 {
 	int is_rtcp = ice == &rtp_session->rtcp_ice;
 	const char *err = "";
 	int i;
-	uint8_t ice_cand_found_idx = 0;
+	int ice_cand_found_idx = -1;
 
 	for (i = 0; i < ice->ice_params->cand_idx[ice->proto]; i++) {
 		if (!strcmp(host, ice->ice_params->cands[i][ice->proto].con_addr) && port == ice->ice_params->cands[i][ice->proto].con_port) {
@@ -609,13 +620,13 @@ static void switch_rtp_change_ice_dest(switch_rtp_t *rtp_session, switch_rtp_ice
 		}
 	}
 
-	if (!ice_cand_found_idx) {
-		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "ICE candidate [%s:%d] replaced with [%s:%d]\n",
-			ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].con_addr, ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].con_port, host, port);
+	if (ice_cand_found_idx < 0) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "ICE candidate [%s:%d] %s on idx [%d] replaced with [%s:%d], mux:%d\n",
+			ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].con_addr, ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].con_port, is_rtcp? "rtcp" : "rtp", ice->ice_params->chosen[ice->proto], host, port, rtp_session->flags[SWITCH_RTP_FLAG_RTCP_MUX]);
 		ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].con_addr = switch_core_strdup(rtp_session->pool, host);
 		ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].con_port = port;
 	} else {
-		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "ICE chosen candidate [%s:%d] set to idx [%d]\n", host, port, ice_cand_found_idx);
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "ICE chosen candidate [%s:%d] %s set idx [%d]->[%d], mux:%d\n", host, port, is_rtcp? "rtcp" : "rtp", ice->ice_params->chosen[ice->proto], ice_cand_found_idx, rtp_session->flags[SWITCH_RTP_FLAG_RTCP_MUX]);
 		ice->ice_params->chosen[ice->proto] = ice_cand_found_idx;
 	}
 
@@ -630,10 +641,269 @@ static void switch_rtp_change_ice_dest(switch_rtp_t *rtp_session, switch_rtp_ice
 			ice->addr = rtp_session->remote_addr;
 		}
 	}
-
 }
 
+/*
+ * RFC 8445, Section 7.1.1
+ * The agent MUST include the PRIORITY attribute in its Binding request. The priority value MUST be set to the priority that the agent would assign to a peer-reflexive
+ * candidate discovered through this connectivity check.
+ */
+static uint32_t inline change_candidate_priority_prflx(switch_rtp_ice_t *ice, uint32_t priority)
+{
+	if (ice && (ice->type &ICE_VANILLA))
+		return (priority & 0xffffff) + (1 << 24) * 110;
+	return priority;
+}
 
+#define ACL_PASSED_TRUE 2
+#define ACL_PASSED_FALSE 1
+#define ACL_PASSED_TO_BOOL(char_acl_passed) ((char_acl_passed) > 0 ? (char_acl_passed) - 1 : 0)
+#define ACL_PASSED_TO_BOOL_STR(char_acl_passed) (ACL_PASSED_TO_BOOL((char_acl_passed))? "true" : "false")
+
+static int switch_rtp_ice_acl_check(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, const char *host, switch_port_t port)
+{
+	int is_rtcp;
+	int i;
+	switch_status_t st;
+	char acl_passed;
+
+	if (strlen(host) == 0) 
+		return -1;
+
+	is_rtcp = ice == &rtp_session->rtcp_ice;
+
+	for (i = 0; i < ice->ice_params->cand_idx[ice->proto]; i++) {
+		if (!strcmp(host, ice->ice_params->cands[i][ice->proto].con_addr) && port == ice->ice_params->cands[i][ice->proto].con_port) {
+			if (ice->ice_params->cands[i][ice->proto].acl_passed) {
+				if (ice->ice_params->cands[i][ice->proto].acl_passed == ACL_PASSED_FALSE) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "ICE candidate [%s:%d] %s acl_passed: false\n", host, port, is_rtcp? "rtcp" : "rtp");
+				}
+				return ACL_PASSED_TO_BOOL(ice->ice_params->cands[i][ice->proto].acl_passed);
+			}
+			break;
+		}
+	}
+
+	st = switch_core_media_check_ice_acl(rtp_session->session, rtp_media_type(rtp_session), host);
+	acl_passed = ACL_PASSED_TRUE;
+
+	if (st != SWITCH_STATUS_SUCCESS) {
+		acl_passed = ACL_PASSED_FALSE;
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "ICE candidate [%s:%d] %s acl_passed: false, check_ice_acl: %d\n", host, port, is_rtcp ? "rtcp" : "rtp", st);
+	}
+
+	if (i < ice->ice_params->cand_idx[ice->proto]) 
+		ice->ice_params->cands[i][ice->proto].acl_passed = acl_passed;
+	return ACL_PASSED_TO_BOOL(acl_passed);
+}
+
+static int switch_rtp_ice_add_candidate(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, const char *host, switch_port_t port, uint32_t priority, uint8_t use_candidate)
+{
+	int is_rtcp;
+	int cid;
+
+	if (strlen(host) == 0) return -1;
+	is_rtcp = ice == &rtp_session->rtcp_ice;
+
+	for (int i = 0; i < ice->ice_params->cand_idx[ice->proto]; i++) {
+		if (!strcmp(host, ice->ice_params->cands[i][ice->proto].con_addr) && port == ice->ice_params->cands[i][ice->proto].con_port) {
+			return 0; // found existing
+		}
+	}
+	
+	cid = ice->ice_params->cand_idx[ice->proto];
+	if (cid < MAX_CAND - 1) {
+		switch_status_t st;
+		char acl_passed;
+
+		/* Clear the slot before populating it: check_ice() resets cand_idx to 0 on every
+		   renegotiation but leaves the array contents, so this index may still carry ready,
+		   media_rcv_last and stun_rcv_use_last from a prior negotiation. The fields set below
+		   would mask that only partly - the same hazard inject_trickle_fake_candidate() already
+		   clears explicitly. */
+		memset(&ice->ice_params->cands[cid][ice->proto], 0, sizeof(ice->ice_params->cands[cid][ice->proto]));
+
+		ice->ice_params->cands[cid][ice->proto].foundation = switch_core_strdup(rtp_session->pool, "");
+		ice->ice_params->cands[cid][ice->proto].generation = switch_core_strdup(rtp_session->pool, "");
+		ice->ice_params->cands[cid][ice->proto].raddr = switch_core_strdup(rtp_session->pool, "");
+		ice->ice_params->cands[cid][ice->proto].cand_type = switch_core_strdup(rtp_session->pool, "");
+		ice->ice_params->cands[cid][ice->proto].component_id = is_rtcp ? 2 : 1; // 1=RTP, 2=RTCP
+		ice->ice_params->cands[cid][ice->proto].transport = switch_core_strdup(rtp_session->pool, "");
+		ice->ice_params->cands[cid][ice->proto].rport = 0;
+		ice->ice_params->cands[cid][ice->proto].priority = priority;
+		ice->ice_params->cands[cid][ice->proto].con_addr = switch_core_strdup(rtp_session->pool, host);
+		ice->ice_params->cands[cid][ice->proto].con_port = port;
+		ice->ice_params->cands[cid][ice->proto].use_candidate = use_candidate;
+		ice->ice_params->cands[cid][ice->proto].responsive = 0;
+		ice->ice_params->cand_idx[ice->proto] = cid + 1;
+		
+		st = switch_core_media_check_ice_acl(rtp_session->session, rtp_media_type(rtp_session), host);
+		acl_passed = st != SWITCH_STATUS_SUCCESS ? ACL_PASSED_FALSE : ACL_PASSED_TRUE;
+		ice->ice_params->cands[cid][ice->proto].acl_passed = acl_passed;
+
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "ICE candidate [%s:%d] %s added on idx:%d, ice_type: %d, acl_passed: %s, check_ice_acl: %d\n", host, port, is_rtcp? "rtcp" : "rtp", cid, ice->type, ACL_PASSED_TO_BOOL_STR(acl_passed), st);
+
+		if (use_candidate) {
+			ice->ice_params->cands[cid][ice->proto].stun_rcv_use_last = switch_micro_time_now();
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG6, "Got USE-CANDIDATE on %s:%d\n", host, port);
+		}
+		return 1;
+	} 
+	
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "ICE candidate [%s:%d] %s not added, limit %d reached!\n", host, port, is_rtcp? "rtcp" : "rtp", MAX_CAND);
+	return -1;
+}
+
+static int switch_rtp_ice_find_candidate(switch_rtp_ice_t *ice, const char *addr, const switch_port_t* port)
+{
+	int i;
+	/* handle_ice already guarantees switch_rtp_ready and non-empty ICE credentials at
+	   entry (line ~1184); do not re-check here so the legacy candidate detection matches
+	   the inline loop this replaced (a transiently-false ready() must not drop the match). */
+	if (strlen(addr) == 0 || ice == NULL) return -1;
+
+	for (i = 0; i < ice->ice_params->cand_idx[ice->proto]; i++) {
+		if (!strcmp(addr, ice->ice_params->cands[i][ice->proto].con_addr) && (port == NULL || *port == ice->ice_params->cands[i][ice->proto].con_port)) {
+			return i; // found existing
+		}
+	}
+
+	return -1;
+}
+
+#define STUN_TOO_LONG 20000
+#define MEDIA_TOO_LONG 2000
+#define ADJ_TOO_LONG 1000
+#define MEDIA_FRESH 1000   /* Phase 2: ms; a nominated candidate is "carrying media" if RTP arrived within this window (above the Opus DTX interval of ~400ms, so brief DTX gaps do not read as stale). Chosen keeps priority while its own media is fresh; a hand-over happens once the incumbent stops carrying fresh media OR drops out of the nominated set, and another nominated candidate has fresh media. */
+
+/* Nominated-mode is active only when the opt-in switch is set AND we are controlled;
+   otherwise handle_ice falls back to the legacy (SignalWire) behavior. */
+#define ice_nomination_active(ice) (((ice)->type & ICE_NOMINATION) && ((ice)->type & ICE_CONTROLLED))
+
+static int switch_rtp_ice_is_candidate_nominated(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, const icand_t* cand, int cand_chosen, const switch_time_t* time_now, int stun_timeout) 
+{
+	switch_time_t now;
+	/* Readiness/credential/VANILLA preconditions are validated once by the sole
+	   caller (find_candidate_nominated); do not re-check switch_rtp_ready here, it
+	   would take flag_mutex once per candidate on the STUN hot path. */
+	if (ice == NULL || cand == NULL || cand->stun_rcv_use_last == 0 || !ACL_PASSED_TO_BOOL(cand->acl_passed))
+		return -1;
+
+	now = time_now ? *time_now : switch_micro_time_now();
+	if (stun_timeout == 0) {
+		/* The committed pair stays sticky (long tolerance) so it does not lose
+		   nominated status between consent refreshes; a rival must present a
+		   fresh USE-CANDIDATE (short window) to become eligible for a hand-over. */
+		stun_timeout = cand_chosen ? STUN_TOO_LONG : MEDIA_TOO_LONG;
+	}
+	if (((cand->use_candidate && (ice->type & ICE_CONTROLLED)) || (cand->responsive && 0 == (ice->type & ICE_CONTROLLED))) && (stun_timeout <= 0 || (now - cand->stun_rcv_use_last) / 1000 < stun_timeout))
+		return 1;
+
+	return 0;
+}
+
+static int switch_rtp_ice_find_candidate_nominated(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice)
+{
+	switch_time_t now;
+	uint32_t best_priority = 0;
+	switch_time_t best_media = 0;
+	int i;
+	int idx = -1;            /* highest-priority nominated candidate (fallback) */
+	int media_idx = -1;      /* nominated candidate carrying the freshest media */
+	int chosen;
+	int chosen_nominated = 0;
+	int chosen_media_fresh = 0;
+
+	if (!switch_rtp_ready(rtp_session) || ice == NULL || zstr(ice->user_ice) || zstr(ice->ice_user) || (ice->type & ICE_VANILLA) == 0) return -1;
+
+	now = switch_micro_time_now();
+	chosen = ice->ice_params->chosen[ice->proto];
+
+	/* One pass over the nominated set (USE-CANDIDATE + ICE-ACL + STUN-fresh), tracking
+	   both the highest-priority candidate and the one carrying the freshest media. */
+	for (i = 0; i < ice->ice_params->cand_idx[ice->proto]; i++) {
+		const icand_t *cand = &ice->ice_params->cands[i][ice->proto];
+		int media_fresh;
+
+		if (1 != switch_rtp_ice_is_candidate_nominated(rtp_session, ice, cand, i == chosen, &now, 0)) {
+			continue;
+		}
+
+		if (idx < 0 || cand->priority > best_priority) {
+			best_priority = cand->priority;
+			idx = i;
+		}
+
+		media_fresh = (cand->media_rcv_last && (now - cand->media_rcv_last) / 1000 < MEDIA_FRESH);
+		if (media_fresh && (media_idx < 0 || cand->media_rcv_last > best_media)) {
+			best_media = cand->media_rcv_last;
+			media_idx = i;
+		}
+
+		if (i == chosen) {
+			chosen_nominated = 1;
+			chosen_media_fresh = media_fresh;
+		}
+	}
+
+	if (idx < 0) {
+		return -1;   /* nothing nominated */
+	}
+
+	/* Phase 2 media-driven selection (single authority: the read path only records
+	   media_rcv_last, it never switches - that keeps the write->ice lock order intact):
+	   - keep the incumbent while its own media is fresh (stable, no flapping, honors
+	     an active pair over a-priori priority);
+	   - else follow whichever nominated candidate currently carries media (the
+	     controlling peer's real path) - hand-over within ~MEDIA_FRESH once the
+	     incumbent's media goes stale;
+	   - with no media signal at all, fall back to incumbent hysteresis, then priority
+	     (identical to the pre-Phase-2 behavior during bootstrap / idle / hold). */
+	if (chosen_nominated && chosen_media_fresh) {
+		return chosen;
+	}
+	if (media_idx >= 0) {
+		return media_idx;
+	}
+	if (chosen_nominated) {
+		return chosen;
+	}
+	return idx;
+}
+
+/* Phase 2 (media-driven selection, controlled + nomination + rtcp-mux): the read path
+   only OBSERVES media - it records, per candidate, when authenticated RTP last arrived
+   from it (media_rcv_last). It deliberately does NOT switch the send target here.
+   Switching would call switch_rtp_ice_change_dest -> switch_rtp_set_remote_address, which
+   takes write_mutex while this path holds only ice_mutex, inverting the codebase-wide
+   write->ice lock order (handle_ice and switch_rtp_write_raw both take write_mutex first)
+   and dead-locking cross-thread. switch_rtp_ice_find_candidate_nominated (run from
+   handle_ice under the correct locks) decides the pair - keeping the incumbent while its
+   own media is fresh, else following the nominated candidate that carries fresh media -
+   and handle_ice performs the re-point. Caller holds rtp_session->ice_mutex. */
+static void switch_rtp_media_observe(switch_rtp_t *rtp_session, switch_time_t now)
+{
+	switch_rtp_ice_t *ice = &rtp_session->ice;
+	int i;
+
+	if (!ice_nomination_active(ice) || !rtp_session->flags[SWITCH_RTP_FLAG_RTCP_MUX] || !ice->ice_params) {
+		return;
+	}
+
+	/* Common case: media from the current send target - record it without a scan. */
+	if (switch_cmp_addr(rtp_session->rtp_from_addr, ice->addr, SWITCH_FALSE)) {
+		i = ice->ice_params->chosen[ice->proto];
+	} else {
+		char host[80] = "";
+		switch_port_t port = switch_sockaddr_get_port(rtp_session->rtp_from_addr);
+		switch_get_addr(host, sizeof(host), rtp_session->rtp_from_addr);
+		i = switch_rtp_ice_find_candidate(ice, host, &port);
+	}
+
+	if (i >= 0 && i < ice->ice_params->cand_idx[ice->proto]) {
+		ice->ice_params->cands[i][ice->proto].media_rcv_last = now;
+	}
+}
 
 static handle_rfc2833_result_t handle_rfc2833(switch_rtp_t *rtp_session, switch_size_t bytes, int *do_cng)
 {
@@ -871,11 +1141,6 @@ static int global_init = 0;
 static int rtp_common_write(switch_rtp_t *rtp_session,
 							rtp_msg_t *send_msg, void *data, uint32_t datalen, switch_payload_t payload, uint32_t timestamp, switch_frame_flag_t *flags);
 
-
-#define MEDIA_TOO_LONG 2000
-#define STUN_TOO_LONG 20000
-#define ADJ_TOO_LONG 1000
-
 static void calc_elapsed(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice)
 {
 	switch_time_t ref_point;
@@ -916,8 +1181,21 @@ static switch_status_t ice_out(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice,
 	//switch_sockaddr_t *remote_addr = rtp_session->remote_addr;
 	switch_socket_t *sock_output = rtp_session->sock_output;
 	switch_time_t now = switch_micro_time_now();
+	switch_channel_t *channel;
+	switch_event_t *event;
+	switch_core_media_ice_type_t ice_type;
+	uint64_t ice_tiebreaker;
 
-	if (ice->type & ICE_LITE) {
+	/* Snapshot role + tiebreaker under ice_mutex once: handle_ice mutates them together on
+	   a role switch while holding the mutex, and ice_out is also called from the timer path
+	   without it. Using the locals below avoids a torn read of the (role, tiebreaker) pair.
+	   ice_mutex is nested, so the call from handle_ice (which already holds it) is safe. */
+	switch_mutex_lock(rtp_session->ice_mutex);
+	ice_type = ice->type;
+	ice_tiebreaker = ice->tiebreaker;
+	switch_mutex_unlock(rtp_session->ice_mutex);
+
+	if (ice_type & ICE_LITE) {
 		// no connectivity checks for ICE-Lite
 		return SWITCH_STATUS_BREAK;
 	}
@@ -947,6 +1225,16 @@ static switch_status_t ice_out(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice,
 		if (elapsed > 30000) {
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "No %s stun for a long time!\n", rtp_type(rtp_session));
 			rtp_session->last_stun = switch_micro_time_now();
+			
+			channel = switch_core_session_get_channel(rtp_session->session);
+			if (channel && switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, "media::no_media") == SWITCH_STATUS_SUCCESS)
+			{
+				switch_channel_event_set_data(channel, event);
+				switch_event_add_header(event, SWITCH_STACK_BOTTOM, "Media-Type", "%s", rtp_type(rtp_session));
+				switch_event_add_header(event, SWITCH_STACK_BOTTOM, "Media-No-Media-Ms", "%d", elapsed);
+				switch_event_fire(&event);
+			}
+
 			//status = SWITCH_STATUS_GENERR;
 			//goto end;
 		}
@@ -961,18 +1249,17 @@ static switch_status_t ice_out(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice,
 	//	switch_stun_packet_attribute_add_password(packet, ice->pass, (uint16_t)strlen(ice->pass));
 	//}
 
-	if ((ice->type & ICE_VANILLA)) {
+	if ((ice_type & ICE_VANILLA)) {
 		char sw[128] = "";
-
-		switch_stun_packet_attribute_add_priority(packet, ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].priority);
+		switch_stun_packet_attribute_add_priority(packet, change_candidate_priority_prflx(ice, ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].priority));
 
 		switch_snprintf(sw, sizeof(sw), "FreeSWITCH (%s)", switch_version_revision_human());
 		switch_stun_packet_attribute_add_software(packet, sw, (uint16_t)strlen(sw));
 
-		if ((ice->type & ICE_CONTROLLED)) {
-			switch_stun_packet_attribute_add_controlled(packet);
+		if ((ice_type & ICE_CONTROLLED)) {
+			switch_stun_packet_attribute_add_controlled(packet, ice_tiebreaker);
 		} else {
-			switch_stun_packet_attribute_add_controlling(packet);
+			switch_stun_packet_attribute_add_controlling(packet, ice_tiebreaker);
 			switch_stun_packet_attribute_add_use_candidate(packet);
 		}
 
@@ -1005,6 +1292,25 @@ int icecmp(const char *them, switch_rtp_ice_t *ice)
 	return strcmp(them, ice->luser_ice);
 }
 
+/* Media dual-stack: pick the send socket whose bound family matches addr, so STUN replies
+   and media egress use the receive socket bound to the advertised candidate (symmetric
+   RTP/ICE path) instead of a wrong-family or unbound socket. Returns sock_input for the
+   primary family, sock_input_2 for the second family, or NULL when neither matches (the
+   caller keeps its own fallback). In single-stack sock_input_2/local_addr_2 are NULL, so
+   only the primary-family branch can hit. */
+static switch_socket_t *dual_recv_output_sock(switch_rtp_t *rtp_session, switch_sockaddr_t *addr)
+{
+	if (rtp_session->sock_input && rtp_session->local_addr &&
+		switch_sockaddr_get_family(addr) == switch_sockaddr_get_family(rtp_session->local_addr)) {
+		return rtp_session->sock_input;
+	}
+	if (rtp_session->sock_input_2 && rtp_session->local_addr_2 &&
+		switch_sockaddr_get_family(addr) == switch_sockaddr_get_family(rtp_session->local_addr_2)) {
+		return rtp_session->sock_input_2;
+	}
+	return NULL;
+}
+
 static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *data, switch_size_t len)
 {
 	switch_stun_packet_t *packet;
@@ -1014,7 +1320,7 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 	unsigned char buf[1500] = { 0 };
 	switch_size_t cpylen = len;
 	int ok = 1;
-	uint32_t *pri = NULL;
+	//uint32_t *pri = NULL; // pointer to priority and converted with ntohl, bug(?) used also without ntohl for comparison to priority
 	int is_rtcp = ice == &rtp_session->rtcp_ice;
 	switch_channel_t *channel;
 	int i;
@@ -1022,6 +1328,14 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 	const char *from_host = NULL;
 	switch_port_t from_port = 0;
 	char faddr_buf[80] = "";
+	uint16_t controlling_controlled = 0;
+	uint64_t controlling_controlled_tiebreaker = 0;
+	uint32_t stun_error = 0;
+	uint32_t stun_error_response = 0;
+
+	uint32_t stun_message_priority = 0;
+	uint8_t stun_message_use_candidate = 0;
+	int add_candidate = 0;
 
 	if (is_rtcp) {
 		from_addr = rtp_session->rtcp_from_addr;
@@ -1058,7 +1372,6 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 	if (!packet) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_ERROR, "Invalid STUN/ICE packet received %ld bytes\n", (long)cpylen);
 		goto end;
-
 	}
 
 	if ((ice->type & ICE_VANILLA) && ice->verify_integrity) {
@@ -1102,8 +1415,8 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 	end_buf = buf + ((sizeof(buf) > SWITCH_STUN_PACKET_MIN_LEN + packet->header.length) ? SWITCH_STUN_PACKET_MIN_LEN + packet->header.length : sizeof(buf));
 
 	switch_stun_packet_first_attribute(packet, attr);
-	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG8, "%s STUN PACKET TYPE: %s\n",
-					  rtp_type(rtp_session), switch_stun_value_to_name(SWITCH_STUN_TYPE_PACKET_TYPE, packet->header.type));
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG8, "%s STUN PACKET TYPE: %s from %s\n",
+					  rtp_type(rtp_session), switch_stun_value_to_name(SWITCH_STUN_TYPE_PACKET_TYPE, packet->header.type), from_host);
 	do {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG8, "|---: %s STUN ATTR %d %x %s\n", rtp_type(rtp_session), attr->type, attr->type,
 						  switch_stun_value_to_name(SWITCH_STUN_TYPE_ATTRIBUTE, attr->type));
@@ -1112,9 +1425,11 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 		case SWITCH_STUN_ATTR_USE_CAND:
 			{
 				ice->rready = 1;
+				stun_message_use_candidate = 1;
 				for (i = 0; i < ice->ice_params->cand_idx[ice->proto]; i++) {
 					if (!strcmp(ice->ice_params->cands[i][ice->proto].con_addr, from_host) && ice->ice_params->cands[i][ice->proto].con_port == from_port) {
 						ice->ice_params->cands[i][ice->proto].use_candidate = 1;
+						ice->ice_params->cands[i][ice->proto].stun_rcv_use_last = switch_micro_time_now();
 						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG6, "Got USE-CANDIDATE on %s:%d\n", ice->ice_params->cands[i][ice->proto].con_addr, ice->ice_params->cands[i][ice->proto].con_port);
 					}
 				}
@@ -1130,18 +1445,18 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 								  rtp_type(rtp_session),
 								  code
 								  );
-
-				if ((ice->type & ICE_VANILLA) && code == 487) {
-					if ((ice->type & ICE_CONTROLLED)) {
-						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "%s STUN Changing role to CONTROLLING\n", rtp_type(rtp_session));
-						ice->type &= ~ICE_CONTROLLED;
-					} else {
-						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "%s STUN Changing role to CONTROLLED\n", rtp_type(rtp_session));
-						ice->type |= ICE_CONTROLLED;
-					}
-					packet->header.type = SWITCH_STUN_BINDING_RESPONSE;
-				}
-
+				stun_error = code;
+				// according to RFC 8445 the required action depends on the delivered controlling/controlled and the tiebreaker
+				//if ((ice->type & ICE_VANILLA) && code == 487) {
+				//	if ((ice->type & ICE_CONTROLLED)) {
+				//		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "%s STUN Changing role to CONTROLLING\n", rtp_type(rtp_session));
+				//		ice->type &= ~ICE_CONTROLLED;
+				//	} else {
+				//		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "%s STUN Changing role to CONTROLLED\n", rtp_type(rtp_session));
+				//		ice->type |= ICE_CONTROLLED;
+				//	}
+				//	packet->header.type = SWITCH_STUN_BINDING_RESPONSE;
+				//}
 			}
 			break;
 		case SWITCH_STUN_ATTR_MAPPED_ADDRESS:
@@ -1166,19 +1481,106 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG8, "|------: %s\n", username);
 			}
 			break;
-
 		case SWITCH_STUN_ATTR_PRIORITY:
 			{
-				uint32_t priority = 0;
-				pri = (uint32_t *) attr->value;
-				priority = ntohl(*pri);
+			    uint32_t* pri = (uint32_t *)attr->value;
+				uint32_t priority = ntohl(*pri);
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG8, "|------: %u\n", priority);
-				ok = priority == ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].priority;
+				stun_message_priority = priority;
+				ok = stun_message_priority == change_candidate_priority_prflx(ice, ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].priority);
+			}
+			break;
+		case SWITCH_STUN_ATTR_CONTROLLED:
+		case SWITCH_STUN_ATTR_CONTROLLING:
+			{
+				/* ICE-CONTROLLING/CONTROLLED carry an 8-byte tiebreaker. attr->length is host
+				   order here (converted in switch_stun_packet_parse). Guard the length and
+				   memcpy into an aligned local: a crafted short attribute would otherwise
+				   over-read past the value, and the raw pointer is only 4-byte aligned. A
+				   malformed attribute is ignored entirely, so the role is not recorded. */
+				if (attr->length >= sizeof(uint64_t)) {
+					uint64_t tiebreaker;
+					memcpy(&tiebreaker, attr->value, sizeof(tiebreaker));
+					controlling_controlled = attr->type;
+					controlling_controlled_tiebreaker = ntohll(tiebreaker);
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG8, "|------: tiebreaker: %llu\n", controlling_controlled_tiebreaker);
+				} else {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "%s STUN ICE-CONTROLL* attribute too short (%u bytes), ignored\n", rtp_type(rtp_session), attr->length);
+				}
 			}
 			break;
 		}
 
 	} while (switch_stun_packet_next_attribute(attr, end_buf));
+
+	if (1 != switch_rtp_ice_acl_check(rtp_session, ice, from_host, from_port)) {
+		goto end; // ToDo: Response?: See RFC 8445: If the controlled agent does not accept the request from the
+		          // controlling agent, the controlled agent MUST reject the nomination request
+		          // with an appropriate error code response (e.g., 400)
+    }
+
+	if (ice->type & ICE_VANILLA) {
+		// according to RFC 8445 the required action depends on the delivered controlling/controlled and the tiebreaker
+		if (stun_error == 487) {
+			/* A 487 Role Conflict means the peer runs the SAME role we sent - that is the
+			   definition of the conflict. Standard (non-FS) peers do not echo their ICE
+			   role in the error response (controlling_controlled == 0), so we remember it:
+			   on the first 487 the peer's role equals our current role; we store it and
+			   yield. Every later role-less 487 is resolved against this stored value, which
+			   preserves the original "already handled" idempotency - a duplicate or parallel
+			   487 no longer matches our (now switched) role and is ignored - without
+			   depending on the attribute being present. RFC 8445 7.2.5.1. */
+			if (!controlling_controlled) controlling_controlled = ice->remote_role; /* from the message, if present, else the remembered value */
+			if (!controlling_controlled) controlling_controlled = (ice->type & ICE_CONTROLLED)  /* first 487: peer == our current role */
+				? SWITCH_STUN_ATTR_CONTROLLED : SWITCH_STUN_ATTR_CONTROLLING;
+			ice->remote_role = controlling_controlled;
+
+			if ((ice->type & ICE_CONTROLLED) && controlling_controlled == SWITCH_STUN_ATTR_CONTROLLED) {
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "%s STUN 487: role conflict, switching to CONTROLLING\n", rtp_type(rtp_session));
+				ice->type &= ~ICE_CONTROLLED;
+			} else if (!(ice->type & ICE_CONTROLLED) && controlling_controlled == SWITCH_STUN_ATTR_CONTROLLING) {
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "%s STUN 487: role conflict, switching to CONTROLLED\n", rtp_type(rtp_session));
+				ice->type |= ICE_CONTROLLED;
+			} else {
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG6, "%s STUN 487 already handled, role unchanged\n", rtp_type(rtp_session));
+			}
+			goto end;   /* failed check: skip success processing; next periodic ice_out uses the corrected role */
+		} else if (packet->header.type == SWITCH_STUN_BINDING_REQUEST && controlling_controlled == SWITCH_STUN_ATTR_CONTROLLING && !(ice->type & ICE_CONTROLLED)) {
+		
+			if (ice->tiebreaker >= controlling_controlled_tiebreaker) {
+				// generate SWITCH_STUN_BINDING_ERROR_RESPONSE 487, keep own role
+				stun_error_response = 487;
+				ok = 1;
+			}
+			else {
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "%s STUN Changing role to CONTROLLED\n", rtp_type(rtp_session));
+				ice->type |= ICE_CONTROLLED;
+			}
+		} else if (packet->header.type == SWITCH_STUN_BINDING_REQUEST && controlling_controlled == SWITCH_STUN_ATTR_CONTROLLED && (ice->type & ICE_CONTROLLED)) {
+			if (ice->tiebreaker >= controlling_controlled_tiebreaker) {
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "%s STUN Changing role to CONTROLLING\n", rtp_type(rtp_session));
+				ice->type &= ~ICE_CONTROLLED;
+			}
+			else {
+				// generate SWITCH_STUN_BINDING_ERROR_RESPONSE 487, keep own role
+				stun_error_response = 487;
+				ok = 1;
+			}
+		} 
+		// after role change some actions required: renew pair priority, check the related pair, ...
+	}
+
+	/* Only learn a new candidate from a verified peer (ufrag match) on an actual Binding
+	   request: keeps an ACL-only sender from filling the candidate list (MAX_CAND) and stops
+	   responses / other packet types from being recorded as candidates. */
+	if (packet->header.type == SWITCH_STUN_BINDING_REQUEST && !zstr(username) && !icecmp(username, ice)) {
+		add_candidate = switch_rtp_ice_add_candidate(rtp_session, ice, from_host, from_port, stun_message_priority, stun_message_use_candidate);
+	}
+	if (add_candidate < 0 || 1 != switch_rtp_ice_acl_check(rtp_session, ice, from_host, from_port)) {
+		goto end;
+	}
+	if (add_candidate == 1 && stun_message_use_candidate && (ice->type & ICE_VANILLA) && !icecmp(username, ice))
+		ok = 1;
 
 	if ((ice->type & ICE_GOOGLE_JINGLE) && ok) {
 		ok = !strcmp(ice->user_ice, username);
@@ -1189,6 +1591,7 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 	}
 
 	if ((ice->type & ICE_VANILLA)) {
+		if (!ok) ok = (stun_message_use_candidate != 0 && !icecmp(username, ice));
 		if (!ok) ok = !memcmp(packet->header.id, ice->last_sent_id, 12);
 
 		if (packet->header.type == SWITCH_STUN_BINDING_RESPONSE) {
@@ -1207,25 +1610,33 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 				for (i = 0; i < ice->ice_params->cand_idx[ice->proto]; i++) {
 					if (!strcmp(ice->ice_params->cands[i][ice->proto].con_addr, from_host) && ice->ice_params->cands[i][ice->proto].con_port == from_port) {
 						ice->ice_params->cands[i][ice->proto].responsive = 1;
+						ice->ice_params->cands[i][ice->proto].stun_rcv_use_last = switch_micro_time_now();
 						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "Marked ICE candidate %s:%d as responsive\n", ice->ice_params->cands[i][ice->proto].con_addr, ice->ice_params->cands[i][ice->proto].con_port);
 						if (!strcmp(ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].con_addr, from_host) && ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].con_port == from_port) {
 							ice->cand_responsive = 1;
-							ice->initializing = 0;
+							/* Same DTLS gate as the do_adj path: in nomination+mux mode keep the
+							   initializing probe window open until DTLS is ready so we do not commit
+							   to a not-yet-usable pair here either. Legacy behavior unchanged. */
+							if (!(ice_nomination_active(ice) && rtp_session->flags[SWITCH_RTP_FLAG_RTCP_MUX]) || !rtp_session->dtls || rtp_session->dtls->state == DS_READY) {
+								ice->initializing = 0;
+							}
 							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "Chosen ICE candidate %s:%d is responsive\n", ice->ice_params->cands[i][ice->proto].con_addr, ice->ice_params->cands[i][ice->proto].con_port);
 						}
 					}
 				}
 			}
 
-			if (rtp_session->flags[SWITCH_RTP_FLAG_VIDEO]) {
+			// This line sends PLI/FIR requests to senders which in turn produce keyframes.
+			// We don't want this to happen every time we send a stun response. Philipp: Convince me otherwise :)
+			/*if (rtp_session->flags[SWITCH_RTP_FLAG_VIDEO]) {
 				switch_core_session_video_reinit(rtp_session->session);
-			}
+			}*/
 		}
 
-		if (!ok && ice == &rtp_session->ice && rtp_session->rtcp_ice.ice_params && pri &&
-			*pri == rtp_session->rtcp_ice.ice_params->cands[rtp_session->rtcp_ice.ice_params->chosen[1]][1].priority) {
+		if (!ok && ice == &rtp_session->ice && rtp_session->rtcp_ice.ice_params && stun_message_priority &&
+			stun_message_priority == change_candidate_priority_prflx(ice, rtp_session->rtcp_ice.ice_params->cands[rtp_session->rtcp_ice.ice_params->chosen[1]][1].priority)) {
 			ice = &rtp_session->rtcp_ice;
-			ok = 1;
+			ok = 1; 
 		}
 
 		if (!zstr(username)) {
@@ -1244,16 +1655,16 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 			switch_port_t port = 0;
 			char *host = NULL;
 
-			if (rtp_session->elapsed_stun > STUN_TOO_LONG && pri) {
+			if (rtp_session->elapsed_stun > STUN_TOO_LONG && stun_message_priority) {
 				int i, j;
-				uint32_t old;
+				uint32_t old_port;
 				//const char *tx_host;
 				const char *old_host, *err = NULL;
 				//char bufa[50];
 				char bufb[50];
 				char adj_port[6];
 				switch_channel_t *channel = NULL;
-
+				int skip_auto_adj_block = ice_nomination_active(ice) && rtp_session->flags[SWITCH_RTP_FLAG_RTCP_MUX];
 
 				ice->missed_count++;
 				//switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "missed %d\n", ice->missed_count);
@@ -1269,8 +1680,8 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 						continue;
 					}
 					for (i = 0; i < icep[j]->ice_params->cand_idx[icep[j]->proto]; i++) {
-						if (icep[j]->ice_params &&  icep[j]->ice_params->cands[i][icep[j]->proto].priority == *pri) {
-							if (j == IPR_RTP) {
+						if (icep[j]->ice_params && icep[j]->ice_params->cands[i][icep[j]->proto].priority == stun_message_priority) {
+							if (j == IPR_RTP && !skip_auto_adj_block) {
 								icep[j]->ice_params->chosen[j] = i;
 								switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_INFO, "Change candidate index to %d\n", i);
 							}
@@ -1282,7 +1693,11 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 								break;
 							}
 
-							old = rtp_session->eff_remote_port;
+							if (skip_auto_adj_block) { 
+								continue;
+							}
+
+							old_port = rtp_session->eff_remote_port;
 
 							//tx_host = switch_get_addr(bufa, sizeof(bufa), rtp_session->from_addr);
 							old_host = switch_get_addr(bufb, sizeof(bufb), rtp_session->remote_addr);
@@ -1296,7 +1711,7 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 							}
 
 							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_INFO,
-											  "%s ICE Auto Changing port from %s:%u to %s:%u\n", rtp_type(rtp_session), old_host, old, host, port);
+											  "%s ICE Auto Changing port from %s:%u to %s:%u\n", rtp_type(rtp_session), old_host, old_port, host, port);
 
 
 							if (channel) {
@@ -1361,9 +1776,38 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 			switch_time_t now = switch_micro_time_now();
 			int cmp = 0;
 			int cur_idx = -1, is_relay = 0, is_responsive = 0, use_candidate = 0;
+			int nominated_idx = -1;
+			int nominated = -1;
+			int nomination_locked = 0;
+			int nomination_on = 0;
+			int cand_is_responsive = 0;
 
 			if (is_rtcp) {
 				sock_output = rtp_session->rtcp_sock_output;
+			}
+
+			/* Media dual-stack: answer STUN on the socket whose family matches the request
+			   source, not the fixed media sock_output. In dual-recv a connectivity check can
+			   arrive on either family (both sockets are polled); the media sock_output is bound
+			   to the SELECTED family only, so replying through it drops every response to a
+			   check that arrived on the other family - e.g. the role-conflict 487 for a
+			   v4-arriving check while the selected family is v6 - and the peer never learns to
+			   switch roles. Only when the 2nd receive socket is active; single-stack keeps the
+			   previous sock_output unchanged. from_addr->family is trustworthy here thanks to
+			   the win32 recvfrom vars_set fix; if it still matched neither local family we keep
+			   the default socket (no worse than before) and say so in the log. */
+			if (!is_rtcp && rtp_session->sock_input_2 && rtp_session->local_addr_2) {
+				switch_socket_t *fam_sock = dual_recv_output_sock(rtp_session, from_addr);
+				if (fam_sock) {
+					sock_output = fam_sock;
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG8,
+						"%s STUN reply to %s routed on family-matched socket (dual-stack)\n",
+						rtp_type(rtp_session), switch_get_addr(ipbuf, sizeof(ipbuf), from_addr));
+				} else {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG8,
+						"%s STUN reply to %s: source family matched no local family, using default socket (dual-stack)\n",
+						rtp_type(rtp_session), switch_get_addr(ipbuf, sizeof(ipbuf), from_addr));
+				}
 			}
 
 			if (!ice->ready) {
@@ -1371,7 +1815,23 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 			}
 
 			memset(stunbuf, 0, sizeof(stunbuf));
-			rpacket = switch_stun_packet_build_header(SWITCH_STUN_BINDING_RESPONSE, packet->header.id, stunbuf);
+			rpacket = switch_stun_packet_build_header(stun_error_response ? SWITCH_STUN_BINDING_ERROR_RESPONSE : SWITCH_STUN_BINDING_RESPONSE, packet->header.id, stunbuf);
+
+			if (stun_error_response) { 
+				if (stun_error_response == 487) {
+					if (ice->type & ICE_CONTROLLED) {
+						switch_stun_packet_attribute_add_controlled(rpacket, ice->tiebreaker);
+						switch_stun_packet_attribute_add_error(rpacket, stun_error_response, "Ice Role Conflict. Both peers assume the controlled role, but this entity won the tie-breaker.");
+					} else {
+						switch_stun_packet_attribute_add_controlling(rpacket, ice->tiebreaker);
+						switch_stun_packet_attribute_add_error(rpacket, stun_error_response, "Ice Role Conflict. Both peers assume the controlling role, but this entity won the tie-breaker.");
+					}
+				}
+				else {
+					switch_stun_packet_attribute_add_error(rpacket, stun_error_response, "");
+				}
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "%s STUN Returning error %d\n", rtp_type(rtp_session), stun_error_response);
+			}
 
 			if ((ice->type & ICE_GOOGLE_JINGLE)) {
 				switch_stun_packet_attribute_add_username(rpacket, username, (uint16_t)strlen(username));
@@ -1388,31 +1848,107 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 
 			bytes = switch_stun_packet_length(rpacket);
 
+			if (stun_error_response) { 
+				goto response; 
+			}
+
 			host2 = switch_get_addr(buf2, sizeof(buf2), ice->addr);
 			port2 = switch_sockaddr_get_port(ice->addr);
 			cmp = switch_cmp_addr(from_addr, ice->addr, SWITCH_FALSE);
 
-			for (i = 0; i < ice->ice_params->cand_idx[ice->proto]; i++) {
-				if (!strcmp(ice->ice_params->cands[i][ice->proto].con_addr, from_host) && ice->ice_params->cands[i][ice->proto].con_port == from_port) {
-					if (!strcasecmp(ice->ice_params->cands[i][ice->proto].cand_type, "relay")) {
-						is_relay = 1;
-					}
+			/* RTCP-MUX is a hard prerequisite for nomination: switch_rtp_ice_change_dest
+			   only re-points ice->addr in the mux/rtcp case, so without mux cmp would
+			   never latch and the nominated adjust would churn. Without mux we run the
+			   legacy path. */
+			nomination_on = ice_nomination_active(ice) && rtp_session->flags[SWITCH_RTP_FLAG_RTCP_MUX];
 
-					if (ice->ice_params->cands[i][ice->proto].responsive) {
-						is_responsive = 1;
-					}
+			if (nomination_on && stun_message_use_candidate)
+				is_responsive = 1; // nomination mode: a received USE-CANDIDATE marks this exchange responsive
 
-					if (ice->ice_params->cands[i][ice->proto].use_candidate) {
-						use_candidate = 1;
-					}
+			/* Resolve the globally nominated candidate up front, independent of this
+			   packet's source. Once a nominee exists the lock suppresses the legacy
+			   auto-adjust for every non-nominated source, so only the nominated pair
+			   can move chosen (prevents flapping during the nomination window). */
+			if (nomination_on) {
+				nominated_idx = switch_rtp_ice_find_candidate_nominated(rtp_session, ice);
+				nomination_locked = nominated_idx >= 0;
+
+				/* Phase 2 media-driven hand-over: if the nominee differs from the current
+				   send target and is carrying fresh media, switch to it directly instead of
+				   waiting for a STUN packet from it (which would bind the hand-over latency
+				   to the peer's STUN/consent cadence). Safe: the nominee passed
+				   is_candidate_nominated (use_candidate + ICE-ACL + STUN-fresh), and we hold
+				   write->ice here (handle_ice), so change_dest -> set_remote_address keeps the
+				   codebase lock order (no read-path inversion). The last_adj gate inherits the
+				   legacy settling interval, so a transient media blip cannot flap the target. */
+				if (nominated_idx >= 0 && nominated_idx != ice->ice_params->chosen[ice->proto] &&
+					ice->ice_params->cands[nominated_idx][ice->proto].media_rcv_last &&
+					(now - ice->ice_params->cands[nominated_idx][ice->proto].media_rcv_last) / 1000 < MEDIA_FRESH &&
+					(now - rtp_session->last_adj) / 1000 > ADJ_TOO_LONG) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_NOTICE,
+						"ICE media-driven hand-over: %s send target idx %d -> %d (%s:%d)\n", rtp_type(rtp_session),
+						ice->ice_params->chosen[ice->proto], nominated_idx,
+						ice->ice_params->cands[nominated_idx][ice->proto].con_addr,
+						ice->ice_params->cands[nominated_idx][ice->proto].con_port);
+					switch_rtp_ice_change_dest(rtp_session, ice,
+						ice->ice_params->cands[nominated_idx][ice->proto].con_addr,
+						ice->ice_params->cands[nominated_idx][ice->proto].con_port);
+					rtp_session->last_adj = now;
+					/* change_dest re-pointed ice->addr; refresh cmp so the downstream
+					   do_adj / last_ok logic does not act on the pre-switch comparison
+					   (a stale cmp would trigger a redundant second change_dest). */
+					cmp = switch_cmp_addr(from_addr, ice->addr, SWITCH_FALSE);
+					/* We just committed to a live, media-carrying pair, so consent is alive;
+					   refresh last_ok explicitly - the recomputed cmp is false when the
+					   triggering packet came from the outgoing incumbent, which would
+					   otherwise skip the cmp-gated last_ok refresh for this valid packet. */
+					ice->last_ok = now;
 				}
 			}
 
-			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5,
-				"%s %s STUN from %s:%d %s is_relay: %d is_responsive: %d use_candidate: %d ready: %d, rready: %d\n", switch_channel_get_name(channel), rtp_type(rtp_session), from_host, from_port, cmp ? "EXPECTED" : "IGNORED",
-				is_relay, is_responsive, use_candidate, ice->ready, ice->rready);
+			if ((i = switch_rtp_ice_find_candidate(ice, from_host, &from_port)) >= 0) {
+				if (!strcasecmp(ice->ice_params->cands[i][ice->proto].cand_type, "relay")) {
+					is_relay = 1;
+				}
 
-			if (ice->initializing && !cmp) {
+				if (ice->ice_params->cands[i][ice->proto].responsive) {
+					is_responsive = 1;
+					cand_is_responsive = 1;
+				}
+
+				if (ice->ice_params->cands[i][ice->proto].use_candidate) {
+					use_candidate = 1;
+				}
+
+				if (nomination_on) {
+					if (nominated_idx >= 0 && ice->ice_params->chosen[ice->proto] == nominated_idx) {
+						nominated = 2;
+					}
+					else {
+						nominated = nominated_idx == i;
+					}
+				}
+			}
+			
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5,
+				"%s %s STUN from %s:%d %s is_relay: %d, is_responsive: %d, use_candidate: %d, nominated: %d, ready: %d, rready: %d, initializing: %d, ice_type: %d, DTLS-state: %d\n", switch_channel_get_name(channel), rtp_type(rtp_session), from_host, from_port, cmp ? "EXPECTED" : "OFFERED",
+				is_relay, is_responsive, use_candidate, nominated, ice->ready, ice->rready, ice->initializing, ice->type, rtp_session->dtls ? rtp_session->dtls->state : 0);
+
+			/* Move onto the nominated pair: nominated==1 is the initial/hand-over move
+			   (chosen != nominee); nominated==2 with a request from the nominee itself
+			   aligns ice->addr when it was not yet pointed there. Only the nominated
+			   candidate's own source triggers this (i == chosen), so a silent port
+			   drift on the committed pair is not followed. */
+			if (!cmp && (nominated == 1 || (nominated == 2 && i == ice->ice_params->chosen[ice->proto]))) {
+				do_adj++;
+				rtp_session->last_adj = now;
+
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "%s %s %s ICE ADJUST CONTROLLED on nominated binding request from %s:%d (is_relay: %d, is_responsive: %d, use_candidate: %d) Current cand: %s:%d typ: %s\n",
+					switch_channel_get_name(channel), rtp_type(rtp_session), is_rtcp ? "rtcp" : "rtp", from_host, from_port, is_relay, is_responsive, use_candidate,
+					ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].con_addr, ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].con_port, ice->ice_params->cands[ice->ice_params->chosen[ice->proto]][ice->proto].cand_type);
+			}
+
+			if (!nomination_locked && nominated != 2 && ice->initializing && !cmp && !do_adj) {
 				if (!rtp_session->adj_window && (!ice->ready || !ice->rready || (!rtp_session->dtls || rtp_session->dtls->state != DS_READY))) {
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "%s %s %s ICE set ADJUST window to 10 seconds on binding request from %s:%d (is_relay: %d, is_responsivie: %d, use_candidate: %d) Current cand: %s:%d typ: %s\n",
 						switch_channel_get_name(channel), rtp_type(rtp_session), is_rtcp ? "rtcp" : "rtp", from_host, from_port, is_relay, is_responsive, use_candidate,
@@ -1456,7 +1992,7 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 
 			if (cmp) {
 				ice->last_ok = now;
-			} else if (!do_adj) {
+			} else if (!nomination_locked && nominated != 2 && !do_adj) {
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "ICE %d/%d dt:%d i:%d i2:%d cmp:%d\n", rtp_session->elapsed_stun, rtp_session->elapsed_media, (rtp_session->dtls && rtp_session->dtls->state != DS_READY), !ice->ready, !ice->rready, switch_cmp_addr(from_addr, ice->addr, SWITCH_TRUE));
 
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "%s %s %s ICE ADJUST ELAPSED vs 1000 %d on binding request from %s:%d (is_relay: %d, is_responsive: %d, use_candidate: %d) Current cand: %s:%d typ: %s\n",
@@ -1509,31 +2045,44 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 				ice->missed_count = 0;
 				ice->rready = 1;
 
+				/* Pre-seed chosen with the address-matching candidate so change_dest's
+				   peer-reflexive (not-found) branch updates that candidate instead of a
+				   stale one; log after change_dest so idx reflects the final pair. */
 				if (cur_idx > -1) {
 					ice->ice_params->chosen[ice->proto] = cur_idx;
 				}
-				
+
+				switch_rtp_ice_change_dest(rtp_session, ice, from_host, from_port);
+
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_NOTICE,
 								  "Auto Changing %s stun/%s/dtls port from %s:%u to %s:%u idx:%d\n", rtp_type(rtp_session), is_rtcp ? "rtcp" : "rtp",
 								  host2, port2,
-								  from_host, from_port, cur_idx);
-
-				switch_rtp_change_ice_dest(rtp_session, ice, from_host, from_port);
+								  from_host, from_port, ice->ice_params->chosen[ice->proto]);
 
 				ice->cand_responsive = is_responsive;
-				if (ice->cand_responsive) {
+				/* In nomination mode a received USE-CANDIDATE forces is_responsive; keep
+				   the initializing probe window open until DTLS is actually ready so we do
+				   not commit to a pair that is not yet usable. Legacy behavior unchanged. */
+				if (ice->cand_responsive && (!nomination_on || !rtp_session->dtls || rtp_session->dtls->state == DS_READY)) {
 					ice->initializing = 0;
 				}
 
 				ice->last_ok = now;
 			}
+
+response:
 			//if (cmp) {
 			switch_socket_sendto(sock_output, from_addr, 0, (void *) rpacket, &bytes);
 			//}
 
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG6, "Send STUN Binding Response to %s:%u\n", from_host, from_port);
 
-			if (ice->initializing && !is_responsive) {
+			/* Fire the triggered check on GENUINE candidate responsiveness only. In
+			   nomination mode is_responsive is force-set by an incoming USE-CANDIDATE
+			   (line ~1651); gating on that would suppress this probe and delay DTLS
+			   until the periodic check (~1s). cand_is_responsive reflects an actual
+			   binding-response, matching the legacy behavior. */
+			if (ice->initializing && !cand_is_responsive) {
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "Send STUN Binding Request on ICE candidate still unresponsive to %s:%u\n", from_host, from_port);
 				if (ice_out(rtp_session, ice, SWITCH_TRUE) != SWITCH_STATUS_SUCCESS) {
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "Error sending STUN Binding Request on ICE candidate still unresponsive to %s:%u\n", from_host, from_port);
@@ -1552,13 +2101,9 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG,
 							  "STUN/ICE binding error received on %s channel\n", rtp_type(rtp_session));
 		}
-
 	}
 
-
-
-
- end:
+end:
 	switch_mutex_unlock(rtp_session->ice_mutex);
 	WRITE_DEC(rtp_session);
 	READ_DEC(rtp_session);
@@ -2903,6 +3448,18 @@ SWITCH_DECLARE(switch_status_t) switch_rtp_set_local_address(switch_rtp_t *rtp_s
 		switch_rtp_kill_socket(rtp_session);
 	}
 
+	/* Media dual-stack: the primary socket is being rebuilt, so the cached combined pollset
+	   (read_pollfd_dual) and the second-family socket now reference the OLD primary. Tear the
+	   second family down here; core_media re-enables it after re-activation. */
+	if (rtp_session->sock_input_2) {
+		if (rtp_session->sock_input_2 != rtp_session->sock_output) {
+			switch_socket_close(rtp_session->sock_input_2);
+		}
+		rtp_session->sock_input_2 = NULL;
+	}
+	rtp_session->read_pollfd_dual = NULL;
+	rtp_session->local_addr_2 = NULL;
+
 	if (switch_socket_create(&new_sock, switch_sockaddr_get_family(rtp_session->local_addr), SOCK_DGRAM, 0, rtp_session->pool) != SWITCH_STATUS_SUCCESS) {
 		*err = "Socket Error!";
 		goto done;
@@ -3023,6 +3580,126 @@ SWITCH_DECLARE(switch_status_t) switch_rtp_set_local_address(switch_rtp_t *rtp_s
 		WRITE_DEC(rtp_session);
 		READ_DEC(rtp_session);
 	}
+
+	return status;
+}
+
+/* Media dual-stack: bind a second receive socket to the OTHER media family at alt_host:alt_port
+   (the alt host candidate gen_ice advertised - same port as the primary). Mirror of
+   enable_local_rtcp_socket. Additive: leaves sock_input/local_addr untouched. */
+static switch_status_t enable_dual_recv_socket(switch_rtp_t *rtp_session, const char *alt_host, switch_port_t alt_port, const char **err)
+{
+	switch_socket_t *new_sock = NULL, *old_sock = NULL;
+
+	if (zstr(alt_host) || !alt_port) {
+		*err = "Dual-stack address error";
+		return SWITCH_STATUS_FALSE;
+	}
+
+	/* Idempotent: on re-activation (re-INVITE / ICE restart) we are normally asked for the same
+	   alt address/port that is already bound. Do nothing then - this avoids re-alloc churn and,
+	   crucially, avoids closing a sock_input_2 that may currently be aliased as sock_output. */
+	if (rtp_session->sock_input_2 && rtp_session->read_pollfd_dual && rtp_session->local_addr_2) {
+		char cur[80] = "";
+		switch_get_addr(cur, sizeof(cur), rtp_session->local_addr_2);
+		if (!zstr(cur) && !strcmp(cur, alt_host) && switch_sockaddr_get_port(rtp_session->local_addr_2) == alt_port) {
+			return SWITCH_STATUS_SUCCESS;
+		}
+	}
+
+	if (switch_sockaddr_info_get(&rtp_session->local_addr_2, alt_host, SWITCH_UNSPEC, alt_port, 0, rtp_session->pool) != SWITCH_STATUS_SUCCESS) {
+		*err = "Dual-stack local address error";
+		return SWITCH_STATUS_FALSE;
+	}
+
+	if (switch_socket_create(&new_sock, switch_sockaddr_get_family(rtp_session->local_addr_2), SOCK_DGRAM, 0, rtp_session->pool) != SWITCH_STATUS_SUCCESS) {
+		*err = "Dual-stack socket error";
+		return SWITCH_STATUS_FALSE;
+	}
+
+	if (switch_socket_opt_set(new_sock, SWITCH_SO_REUSEADDR, 1) != SWITCH_STATUS_SUCCESS) {
+		switch_socket_close(new_sock);
+		*err = "Dual-stack socket opt error";
+		return SWITCH_STATUS_FALSE;
+	}
+
+	if (rtp_session->flags[SWITCH_RTP_FLAG_VIDEO]) {
+		switch_socket_opt_set(new_sock, SWITCH_SO_RCVBUF, 1572864);
+		switch_socket_opt_set(new_sock, SWITCH_SO_SNDBUF, 1572864);
+	} else {
+		switch_socket_opt_set(new_sock, SWITCH_SO_RCVBUF, 851968);
+		switch_socket_opt_set(new_sock, SWITCH_SO_SNDBUF, 851968);
+	}
+
+	if (switch_socket_bind(new_sock, rtp_session->local_addr_2) != SWITCH_STATUS_SUCCESS) {
+		switch_socket_close(new_sock);
+		*err = "Dual-stack bind error";
+		return SWITCH_STATUS_FALSE;
+	}
+
+	/* Dual-stack requires non-blocking sockets: the read path polls a combined pollset over
+	   both families and then recvfrom's them in turn WITHOUT re-polling, so a recvfrom on the
+	   idle family must return immediately. Force NONBLOCK on both and set the session flag so
+	   the blocking-restore paths (do_flush) never re-block one of them. */
+	switch_socket_opt_set(new_sock, SWITCH_SO_NONBLOCK, TRUE);
+	switch_rtp_set_flag(rtp_session, SWITCH_RTP_FLAG_NOBLOCK); /* also sets sock_input NONBLOCK */
+
+	old_sock = rtp_session->sock_input_2;
+	rtp_session->sock_input_2 = new_sock;
+	new_sock = NULL;
+
+	/* Build the combined read pollset: one contiguous 2-element array [sock_input, sock_input_2]
+	   so every switch_poll(read_pollfd_dual, 2, ...) site wakes on EITHER family. The descriptor
+	   fields are filled by switch_socket_create_pollfd and copied into the array. */
+	{
+		switch_pollfd_t *pfd0 = NULL, *pfd1 = NULL, *arr;
+
+		if (switch_socket_create_pollfd(&pfd0, rtp_session->sock_input, SWITCH_POLLIN | SWITCH_POLLERR, rtp_session->sock_input, rtp_session->pool) == SWITCH_STATUS_SUCCESS &&
+			switch_socket_create_pollfd(&pfd1, rtp_session->sock_input_2, SWITCH_POLLIN | SWITCH_POLLERR, rtp_session->sock_input_2, rtp_session->pool) == SWITCH_STATUS_SUCCESS) {
+			arr = switch_core_alloc(rtp_session->pool, sizeof(switch_pollfd_t) * 2);
+			arr[0] = *pfd0;
+			arr[1] = *pfd1;
+			rtp_session->read_pollfd_dual = arr;
+		} else {
+			*err = "Dual-stack pollset error";
+			switch_socket_close(rtp_session->sock_input_2);
+			rtp_session->sock_input_2 = NULL;
+			rtp_session->read_pollfd_dual = NULL;   /* fall back to single-family, no stale array */
+			if (old_sock && old_sock != rtp_session->sock_output) {
+				switch_socket_close(old_sock);      /* don't leak the previous second-family socket */
+			}
+			return SWITCH_STATUS_FALSE;
+		}
+	}
+
+	/* Guard: on a genuine rebuild (alt address changed) the previous socket may still be aliased
+	   as sock_output - closing it would dangle the send path. Teardown/set_remote_address handle
+	   that alias; leave it be here. */
+	if (old_sock && old_sock != rtp_session->sock_output) {
+		switch_socket_close(old_sock);
+	}
+
+	return SWITCH_STATUS_SUCCESS;
+}
+
+SWITCH_DECLARE(switch_status_t) switch_rtp_enable_dual_recv(switch_rtp_t *rtp_session, const char *alt_host, switch_port_t alt_port, const char **err)
+{
+	switch_status_t status;
+
+	*err = NULL;
+
+	if (!switch_rtp_ready(rtp_session)) {
+		*err = "RTP not ready";
+		return SWITCH_STATUS_FALSE;
+	}
+
+	READ_INC(rtp_session);
+	WRITE_INC(rtp_session);
+
+	status = enable_dual_recv_socket(rtp_session, alt_host, alt_port, err);
+
+	WRITE_DEC(rtp_session);
+	READ_DEC(rtp_session);
 
 	return status;
 }
@@ -3226,17 +3903,26 @@ SWITCH_DECLARE(switch_status_t) switch_rtp_set_remote_address(switch_rtp_t *rtp_
 	rtp_session->eff_remote_host_str = switch_core_strdup(rtp_session->pool, host);
 	rtp_session->eff_remote_port = port;
 
-	if (rtp_session->sock_input && switch_sockaddr_get_family(rtp_session->remote_addr) == switch_sockaddr_get_family(rtp_session->local_addr)) {
-		rtp_session->sock_output = rtp_session->sock_input;
-	} else {
-		if (rtp_session->sock_output && rtp_session->sock_output != rtp_session->sock_input) {
-			switch_socket_close(rtp_session->sock_output);
-		}
-		if ((status = switch_socket_create(&rtp_session->sock_output,
-										   switch_sockaddr_get_family(rtp_session->remote_addr),
-										   SOCK_DGRAM, 0, rtp_session->pool)) != SWITCH_STATUS_SUCCESS) {
+	{
+		/* Send from the receive socket bound to the remote's family so the source address
+		   matches the advertised candidate (symmetric RTP/ICE), instead of an unbound
+		   ephemeral-port socket. Covers single-stack (primary family) and dual-stack (the peer
+		   selected our second-family candidate); shared with the STUN-reply path via
+		   dual_recv_output_sock(). Only when neither bound family matches do we create a new
+		   output socket for the remote family (legacy fallback). */
+		switch_socket_t *fam_sock = dual_recv_output_sock(rtp_session, rtp_session->remote_addr);
+		if (fam_sock) {
+			rtp_session->sock_output = fam_sock;
+		} else {
+			if (rtp_session->sock_output && rtp_session->sock_output != rtp_session->sock_input && rtp_session->sock_output != rtp_session->sock_input_2) {
+				switch_socket_close(rtp_session->sock_output);
+			}
+			if ((status = switch_socket_create(&rtp_session->sock_output,
+											   switch_sockaddr_get_family(rtp_session->remote_addr),
+											   SOCK_DGRAM, 0, rtp_session->pool)) != SWITCH_STATUS_SUCCESS) {
 
-			*err = "Socket Error!";
+				*err = "Socket Error!";
+			}
 		}
 	}
 
@@ -3451,6 +4137,61 @@ static void free_dtls(switch_dtls_t **dtlsp)
 	}
 }
 
+/* DTLS-over-ICE peer binding: returns the ice_params candidate index whose address matches the
+   current DTLS packet source (rtp_session->from_addr) AND counts as a bound peer path, else -1.
+   DTLS stays on the connection it started on while ICE keeps re-optimizing the selected pair, so
+   binding to the single current ice->addr would drop in-flight DTLS on every ICE switch; accepting
+   any bound candidate keeps the handshake alive.
+
+   Bound = 'responsive' (the candidate answered a Binding Response from its address) OR peer-
+   nominated via switch_rtp_ice_is_candidate_nominated (role-dependent: when FS is CONTROLLED that
+   means the candidate carries a fresh USE-CANDIDATE; when FS is CONTROLLING it reduces to
+   'responsive', so this only widens acceptance in the controlled case). The controlled/USE-CANDIDATE
+   arm is what covers dual-stack: FS probes only the one chosen candidate (ice_out sends to ice->addr),
+   so the family the peer actually uses may never become 'responsive' on its own.
+
+   NOTE on the trust level: this is NOT cryptographic. FreeSWITCH does not verify inbound
+   MESSAGE-INTEGRITY, and 'responsive' is set for any Binding Response from the candidate 5-tuple
+   without checking the transaction id (handle_ice forces ok=1 for responses); use_candidate is set
+   the same way from a Binding request. So both signals mean the same thing - a packet arrived from a
+   known candidate address that passed the IP-ACL. Widening from responsive-only to also-nominated
+   therefore does NOT lower the bar: an off-path sender able to forge one could already forge the
+   other. The barrier here is the IP-ACL + 5-tuple match, not ICE credentials. Callers hold ice_mutex. */
+static int dtls_validated_ice_cand_idx(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice)
+{
+	char host[80] = "";
+	switch_port_t port;
+	int i;
+
+	if (!ice->ice_params) {
+		return -1;
+	}
+
+	switch_get_addr(host, sizeof(host), rtp_session->from_addr);
+	port = switch_sockaddr_get_port(rtp_session->from_addr);
+
+	for (i = 0; i < ice->ice_params->cand_idx[ice->proto]; i++) {
+		icand_t *cand = &ice->ice_params->cands[i][ice->proto];
+
+		if (!cand->con_addr || strcmp(host, cand->con_addr) || port != cand->con_port) {
+			continue;
+		}
+		if (cand->responsive) {
+			return i;
+		}
+		/* Peer-nominated (not yet responsive) is accepted ONLY under the ice_nomination opt-in.
+		   Without it every controlled call keeps the legacy responsive-only gate, so this does not
+		   widen DTLS acceptance for non-nomination sessions. is_candidate_nominated is itself role-
+		   gated (controlled -> use_candidate, controlling -> responsive). */
+		if (ice_nomination_active(ice) &&
+			1 == switch_rtp_ice_is_candidate_nominated(rtp_session, ice, cand, i == ice->ice_params->chosen[ice->proto], NULL, 0)) {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
 static int do_dtls(switch_rtp_t *rtp_session, switch_dtls_t *dtls)
 {
 	int r = 0, ret = 0, len;
@@ -3464,23 +4205,59 @@ static int do_dtls(switch_rtp_t *rtp_session, switch_dtls_t *dtls)
 		return 0;
 	}
 
-	if (is_ice && !(rtp_session->ice.type & ICE_LITE) && !rtp_session->ice.cand_responsive) {
-		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG6, "Got DTLS packet but candidate is not responsive\n");
+	/* When ICE is active, an incoming DTLS record is accepted only from a peer that
+	   ICE has already validated (a candidate that answered a connectivity check with
+	   the negotiated ICE credentials), which rejects off-path injection.
 
-		return 0;
+	   The binding is to ANY responsive candidate, not to the single currently
+	   selected ice.addr. DTLS stays on the connection it started on while ICE keeps
+	   re-optimizing the selected pair underneath it; binding to the one current
+	   address would drop in-flight DTLS on every ICE switch and stall the handshake
+	   until DTLS retransmit backoff (1s, 2s, 4s ...) recovers. The original single
+	   address gate (upstream SignalWire commit 104c0b3fec, "Fix flopping routes on
+	   ICE negotiation") caused exactly that and led to massive connection-setup
+	   problems in our customer deployments.
+
+	   The channel variable "ice_disable_dtls_protection" suspends the binding
+	   entirely - reserved for special cases, test and diagnosis. With it set the
+	   DTLS server role accepts records from any source and, since there is no
+	   fingerprint fallback in the server role, an off-path sender can abort the
+	   handshake (DoS); no media hijack is possible because all DTLS replies go to
+	   dtls->remote_addr (the SDP/ICE address), never to the packet source. Leave it
+	   unset in production. RFC 8445 section 12. */
+	if (is_ice && !(rtp_session->ice.type & ICE_DISABLE_DTLS_PROTECTION)) {
+		if (!(rtp_session->ice.type & ICE_LITE)) {
+			int cidx = dtls_validated_ice_cand_idx(rtp_session, &rtp_session->ice);
+
+			if (cidx < 0) {
+				char tmp_buf1[80] = "";
+				const char *host_from = switch_get_addr(tmp_buf1, sizeof(tmp_buf1), rtp_session->from_addr);
+
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "Got DTLS packet from [%s] which is not a validated ICE candidate. Ignored.\n", host_from);
+
+				return 0;
+			}
+
+			/* An actual DTLS record from this validated candidate (dtls->bytes > 0, not a
+			   bytes==0 pump for a non-DTLS packet whose from_addr would otherwise be recorded
+			   here) is liveness on the pair the peer really uses for the handshake. Record it
+			   (record only, no switch here - the media-driven hand-over in handle_ice performs
+			   the re-point under the correct locks) so the send target converges onto that
+			   family. FS is the DTLS server and its ServerHello leaves via dtls->sock_output =
+			   the chosen pair, so on a dual-stack peer that picked the non-selected family this
+			   is what moves chosen there and lets the handshake finish.
+
+			   Gated exactly like the other media_rcv_last recorder (switch_rtp_media_observe):
+			   only under ice_nomination + rtcp-mux, which is the sole configuration whose
+			   hand-over consumes media_rcv_last. This also confines the write to the muxed
+			   single-DTLS-channel case, so it is never driven by an RTCP-channel DTLS record
+			   (do_dtls(rtcp_dtls)) whose source is in rtcp_from_addr, not rtp_session->from_addr. */
+			if (dtls->bytes > 0 && ice_nomination_active(&rtp_session->ice) && rtp_session->flags[SWITCH_RTP_FLAG_RTCP_MUX]) {
+				rtp_session->ice.ice_params->cands[cidx][rtp_session->ice.proto].media_rcv_last = switch_micro_time_now();
+			}
+		}
 	}
-
-	if (is_ice && !switch_cmp_addr(rtp_session->from_addr, rtp_session->ice.addr, SWITCH_TRUE)) {
-		char tmp_buf1[80] = "";
-		char tmp_buf2[80] = "";
-		const char *host_from = switch_get_addr(tmp_buf1, sizeof(tmp_buf1), rtp_session->from_addr);
-		const char *host_ice_cur_addr = switch_get_addr(tmp_buf2, sizeof(tmp_buf2), rtp_session->ice.addr);
-
-		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG5, "Got DTLS packet from [%s] whilst current ICE negotiated address is [%s]. Ignored.\n", host_from, host_ice_cur_addr);
-
-		return 0;
-	}
-
+	
 	if (dtls->bytes > 0 && dtls->data) {
 		ret = BIO_write(dtls->read_bio, dtls->data, (int)dtls->bytes);
 		if (ret <= 0) {
@@ -3965,9 +4742,11 @@ SWITCH_DECLARE(switch_status_t) switch_rtp_add_dtls(switch_rtp_t *rtp_session, d
 	ssl_method = (type & DTLS_TYPE_SERVER) ? DTLS_server_method() : DTLS_client_method();
 #else
     #ifdef HAVE_OPENSSL_DTLSv1_2_method
-		ssl_method = (type & DTLS_TYPE_SERVER) ? (want_DTLSv1_2 ? DTLSv1_2_server_method() : DTLSv1_server_method()) : (want_DTLSv1_2 ? DTLSv1_2_client_method() : DTLSv1_client_method());
+	ssl_method = (type & DTLS_TYPE_SERVER) ? DTLS_server_method() : DTLS_client_method();
+	//	ssl_method = (type & DTLS_TYPE_SERVER) ? (want_DTLSv1_2 ? DTLSv1_2_server_method() : DTLSv1_server_method()) : (want_DTLSv1_2 ? DTLSv1_2_client_method() : DTLSv1_client_method());
 	#else
-		ssl_method = (type & DTLS_TYPE_SERVER) ? DTLSv1_server_method() : DTLSv1_client_method();
+	ssl_method = (type & DTLS_TYPE_SERVER) ? DTLS_server_method() : DTLS_client_method();
+	//	ssl_method = (type & DTLS_TYPE_SERVER) ? DTLSv1_server_method() : DTLSv1_client_method();
     #endif // HAVE_OPENSSL_DTLSv1_2_method
 #endif
 
@@ -5084,6 +5863,13 @@ SWITCH_DECLARE(switch_status_t) switch_rtp_activate_ice(switch_rtp_t *rtp_sessio
 														const char *password, const char *rpassword, ice_proto_t proto,
 														switch_core_media_ice_type_t type, ice_t *ice_params)
 {
+	return switch_rtp_activate_ice_v2(rtp_session, login, rlogin, password, rpassword, proto, type, ice_params, NULL);
+}
+
+SWITCH_DECLARE(switch_status_t) switch_rtp_activate_ice_v2(switch_rtp_t *rtp_session, char *login, char *rlogin,
+														const char *password, const char *rpassword, ice_proto_t proto,
+														switch_core_media_ice_type_t type, ice_t *ice_params, ice_t *ice_params_out)
+{
 	char ice_user[STUN_USERNAME_MAX_SIZE];
 	char user_ice[STUN_USERNAME_MAX_SIZE];
 	char luser_ice[SDP_UFRAG_MAX_SIZE];
@@ -5124,11 +5910,41 @@ SWITCH_DECLARE(switch_status_t) switch_rtp_activate_ice(switch_rtp_t *rtp_sessio
 	ice->luser_ice = switch_core_strdup(rtp_session->pool, luser_ice);
 	ice->type = type;
 	ice->ice_params = ice_params;
+	/* Only adopt a non-NULL out-params pointer, so a later legacy switch_rtp_activate_ice()
+	   call (which passes NULL through this function) does not clear a snapshot pointer that a
+	   previous _v2 activation established. */
+	if (ice_params_out) {
+		ice->ice_params_out = ice_params_out;
+	}
 	ice->pass = "";
 	ice->rpass = "";
 	ice->verify_integrity = 0;
 	ice->next_run = switch_micro_time_now();
 	ice->initializing = 1;
+	if (proto != IPR_RTP && rtp_session->ice.tiebreaker) {
+		/* RFC 8445 5.2: all components of one ICE session share a single tiebreaker.
+		   The RTCP component reuses the RTP component's value (RTP is activated first);
+		   the guard falls back to generating one if RTCP is activated before RTP. */
+		ice->tiebreaker = rtp_session->ice.tiebreaker;
+	} else if (type & ICE_CONTROLLED) {
+		ice->tiebreaker = 0; //we intend to be always breakable!
+	} else {
+		ice->tiebreaker = switch_stun_random_tiebreaker();
+	}
+
+	ice->remote_role = 0;   /* peer ICE role unknown until learned from a request or a 487 */
+
+	// rest dynamic data controlled by switch_rtp.c
+	if (ice_params) {
+		for (int j = 0; j < MAX_CAND_IDX_COUNT; j++)
+			for (int i = 0; i < ice_params->cand_idx[j]; i++) {
+				ice_params->cands[i][j].use_candidate = 0;
+				ice_params->cands[i][j].responsive = 0;
+				ice_params->cands[i][j].stun_rcv_use_last = 0;
+				ice_params->cands[i][j].media_rcv_last = 0;
+				ice_params->cands[i][j].acl_passed = 0;
+			}
+	}
 
 	if (password) {
 		ice->pass = switch_core_strdup(rtp_session->pool, password);
@@ -5162,10 +5978,15 @@ SWITCH_DECLARE(switch_status_t) switch_rtp_activate_ice(switch_rtp_t *rtp_sessio
 		port = switch_sockaddr_get_port(ice->addr);
 	}
 
-	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_NOTICE, "Activating %s %s ICE: %s %s:%d\n",
-					  proto == IPR_RTP ? "RTP" : "RTCP", rtp_type(rtp_session), ice_user, host, port);
-
-
+	/* "candidates-out" reflects readiness, not a count: gen_ice() populates the single
+	   outgoing candidate at cands[0][0] and sets .ready but never increments cand_idx, so
+	   the counter would always read 0 here. Correcting the counter in gen_ice() is avoided
+	   because ice_out is iterated by cand_idx elsewhere and could regress. */
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_NOTICE, "Activating %s %s ICE: %s %s:%d, candidates-in/out: %d/%d, ice_type: %d\n",
+					  proto == IPR_RTP ? "RTP" : "RTCP", rtp_type(rtp_session), ice_user, host, port,
+					  ice_params ? ice_params->cand_idx[proto] : -1,
+					  ice_params_out ? (ice_params_out->cands[0][proto].ready ? 1 : 0) : -1, type);
+	
 	rtp_session->rtp_bugs |= RTP_BUG_ACCEPT_ANY_PACKETS;
 
 
@@ -5287,6 +6108,10 @@ SWITCH_DECLARE(void) switch_rtp_kill_socket(switch_rtp_t *rtp_session)
 		}
 		if (rtp_session->sock_output && rtp_session->sock_output != rtp_session->sock_input) {
 			switch_socket_shutdown(rtp_session->sock_output, SWITCH_SHUTDOWN_READWRITE);
+		}
+
+		if (rtp_session->sock_input_2 && rtp_session->sock_input_2 != rtp_session->sock_input && rtp_session->sock_input_2 != rtp_session->sock_output) {
+			switch_socket_shutdown(rtp_session->sock_input_2, SWITCH_SHUTDOWN_READWRITE);
 		}
 
 		if (rtp_session->flags[SWITCH_RTP_FLAG_ENABLE_RTCP]) {
@@ -5426,6 +6251,15 @@ SWITCH_DECLARE(void) switch_rtp_destroy(switch_rtp_t **rtp_session)
 		sock = (*rtp_session)->sock_output;
 		(*rtp_session)->sock_output = NULL;
 		switch_socket_close(sock);
+	}
+
+	if ((*rtp_session)->sock_input_2) {
+		switch_socket_t *sock2 = (*rtp_session)->sock_input_2;
+		(*rtp_session)->sock_input_2 = NULL;
+		/* may have been reused as sock_output (alt family selected) and already closed above */
+		if (sock2 != sock) {
+			switch_socket_close(sock2);
+		}
 	}
 
 	if ((sock = (*rtp_session)->rtcp_sock_input)) {
@@ -5609,7 +6443,9 @@ SWITCH_DECLARE(void) switch_rtp_clear_flag(switch_rtp_t *rtp_session, switch_rtp
 		rtp_session->stats.inbound.last_processed_seq = 0;
 	} else if (flag == SWITCH_RTP_FLAG_PAUSE) {
 		reset_jitter_seq(rtp_session);
-	} else if (flag == SWITCH_RTP_FLAG_NOBLOCK && rtp_session->sock_input) {
+	} else if (flag == SWITCH_RTP_FLAG_NOBLOCK && rtp_session->sock_input && !rtp_session->read_pollfd_dual) {
+		/* Media dual-stack keeps its receive sockets non-blocking (the combined-pollset read path
+		   recvfrom's the idle family without re-polling); do not revert to blocking while active. */
 		switch_socket_opt_set(rtp_session->sock_input, SWITCH_SO_NONBLOCK, FALSE);
 	}
 }
@@ -5832,6 +6668,14 @@ static int jb_valid(switch_rtp_t *rtp_session)
 		}
 	}
 
+	/* C4B note: reads rtp_session->dtls->state WITHOUT ice_mutex. The dtls
+	   struct can be freed concurrently by switch_rtp_del_dtls() (which holds
+	   ice_mutex), so this is a latent use-after-free race. Deliberately left
+	   unlocked here: matches upstream (commit 1585ca7aaf locked only
+	   read_rtp_packet) and avoids a per-packet mutex in this hot path. A proper
+	   fix belongs upstream (refcount dtls, or keep it alive for the session
+	   lifetime). The one access C4B introduced was locked (originate CNG patch
+	   in rtp_common_read). */
 	if (rtp_session->dtls && rtp_session->dtls->state != DS_READY) {
 		return 0;
 	}
@@ -5908,6 +6752,12 @@ static switch_size_t do_flush(switch_rtp_t *rtp_session, int force, switch_size_
 			if (switch_rtp_ready(rtp_session)) {
 				bytes = sizeof(rtp_msg_t);
 				switch_socket_recvfrom(rtp_session->from_addr, rtp_session->sock_input, 0, (void *) &rtp_session->recv_msg, &bytes);
+
+				if (rtp_session->sock_input_2 && bytes == 0) {
+					/* dual-stack: also drain the second family so a flush empties both */
+					bytes = sizeof(rtp_msg_t);
+					switch_socket_recvfrom(rtp_session->from_addr, rtp_session->sock_input_2, 0, (void *) &rtp_session->recv_msg, &bytes);
+				}
 
 				if (bytes) {
 					int do_cng = 0;
@@ -6246,6 +7096,30 @@ static switch_bool_t rtp_is_remote_address_advertised_host(switch_rtp_t *rtp_ses
 
 #define return_cng_frame() do_cng = 1; goto timer_check
 
+/* Media dual-stack input poll: when the second-family socket is active, poll BOTH families
+   at once via the combined 2-element pollset, so every read/flush/drain site wakes on either.
+   Returns SUCCESS if either family has data. With no second socket this is the plain single
+   poll (behavior identical to before). */
+static switch_status_t rtp_poll_input(switch_rtp_t *rtp_session, int ms)
+{
+	int fdr = 0;
+
+	if (rtp_session->read_pollfd_dual) {
+		switch_status_t st = switch_poll(rtp_session->read_pollfd_dual, 2, &fdr, ms);
+
+		/* switch_poll() only maps POLLERR/POLLHUP/POLLNVAL -> GENERR for numsock==1; replicate it
+		   for the 2-element set so a broken socket still drives teardown instead of a CPU busy-loop. */
+		if ((rtp_session->read_pollfd_dual[0].rtnevents & (SWITCH_POLLERR | SWITCH_POLLHUP | SWITCH_POLLNVAL)) ||
+			(rtp_session->read_pollfd_dual[1].rtnevents & (SWITCH_POLLERR | SWITCH_POLLHUP | SWITCH_POLLNVAL))) {
+			return SWITCH_STATUS_GENERR;
+		}
+
+		return st;
+	}
+
+	return switch_poll(rtp_session->read_pollfd, 1, &fdr, ms);
+}
+
 static switch_status_t read_rtp_packet(switch_rtp_t *rtp_session, switch_size_t *bytes, switch_frame_flag_t *flags,
 									   payload_map_t **pmapP, switch_status_t poll_status, switch_bool_t return_jb_packet)
 {
@@ -6275,7 +7149,6 @@ static switch_status_t read_rtp_packet(switch_rtp_t *rtp_session, switch_size_t 
 
 	if (block) {
 		int to = 20000;
-		int fdr = 0;
 
 		if (rtp_session->flags[SWITCH_RTP_FLAG_VIDEO]) {
 			to = 100000;
@@ -6285,7 +7158,7 @@ static switch_status_t read_rtp_packet(switch_rtp_t *rtp_session, switch_size_t 
 			}
 		}
 
-		poll_status = switch_poll(rtp_session->read_pollfd, 1, &fdr, to);
+		poll_status = rtp_poll_input(rtp_session, to);
 
 		if (rtp_session->flags[SWITCH_RTP_FLAG_USE_TIMER] && rtp_session->timer.interval) {
 			switch_core_timer_sync(&rtp_session->timer);
@@ -6318,6 +7191,13 @@ static switch_status_t read_rtp_packet(switch_rtp_t *rtp_session, switch_size_t 
 
 	if (poll_status == SWITCH_STATUS_SUCCESS) {
 		status = switch_socket_recvfrom(rtp_session->from_addr, rtp_session->sock_input, 0, (void *) &rtp_session->recv_msg, bytes);
+
+		if (rtp_session->sock_input_2 && (status != SWITCH_STATUS_SUCCESS || *bytes == 0)) {
+			/* Media dual-stack: this wake-up was for the second family (sockets are
+			   non-blocking in dual mode); read it so from_addr reflects its source. */
+			*bytes = sizeof(rtp_msg_t);
+			status = switch_socket_recvfrom(rtp_session->from_addr, rtp_session->sock_input_2, 0, (void *) &rtp_session->recv_msg, bytes);
+		}
 	} else {
 		*bytes = 0;
 	}
@@ -6857,6 +7737,17 @@ static switch_status_t read_rtp_packet(switch_rtp_t *rtp_session, switch_size_t 
 					sbytes = 0;
 				} else {
 					rtp_session->srtp_errs[rtp_session->srtp_idx_rtp] = 0;
+				}
+
+				/* Phase 2: on genuinely authenticated RTP, OBSERVE the peer's media path by
+				   recording media_rcv_last for the source candidate - no send-target switch
+				   here; that decision is made later in switch_rtp_ice_find_candidate_nominated
+				   under handle_ice (self-gated to controlled+nomination+mux). Guard with the
+				   same condition as the unprotect above so stat reflects a real decode (stat
+				   keeps its 0 initializer when unprotect is skipped on SFF_PLC or no recv_ctx). */
+				if (!stat && rtp_session->has_rtp && !(*flags & SFF_PLC) && rtp_session->recv_ctx[rtp_session->srtp_idx_rtp]
+					&& ice_nomination_active(&rtp_session->ice)) {
+					switch_rtp_media_observe(rtp_session, now);
 				}
 
 				*bytes = sbytes;
@@ -7754,7 +8645,6 @@ static int rtp_common_read(switch_rtp_t *rtp_session, switch_payload_t *payload_
 	int sleep_mss = 1000;
 	int poll_sec = 5;
 	int poll_loop = 0;
-	int fdr = 0;
 	int rtcp_fdr = 0;
 	int hot_socket = 0;
 	int read_loops = 0;
@@ -7793,7 +8683,7 @@ static int rtp_common_read(switch_rtp_t *rtp_session, switch_payload_t *payload_
 			rtp_session->read_pollfd) {
 
 			if (rtp_session->jb && !rtp_session->pause_jb && jb_valid(rtp_session)) {
-				while (switch_poll(rtp_session->read_pollfd, 1, &fdr, 0) == SWITCH_STATUS_SUCCESS) {
+				while (rtp_poll_input(rtp_session, 0) == SWITCH_STATUS_SUCCESS) {
 					status = read_rtp_packet(rtp_session, &bytes, flags, pmapP, SWITCH_STATUS_SUCCESS, SWITCH_FALSE);
 
 					if (status == SWITCH_STATUS_GENERR) {
@@ -7816,7 +8706,7 @@ static int rtp_common_read(switch_rtp_t *rtp_session, switch_payload_t *payload_
 
 			} else if ((rtp_session->flags[SWITCH_RTP_FLAG_AUTOFLUSH] || rtp_session->flags[SWITCH_RTP_FLAG_STICKY_FLUSH])) {
 
-				if (switch_poll(rtp_session->read_pollfd, 1, &fdr, 0) == SWITCH_STATUS_SUCCESS) {
+				if (rtp_poll_input(rtp_session, 0) == SWITCH_STATUS_SUCCESS) {
 					status = read_rtp_packet(rtp_session, &bytes, flags, pmapP, SWITCH_STATUS_SUCCESS, SWITCH_FALSE);
 					if (status == SWITCH_STATUS_GENERR) {
 						ret = -1;
@@ -7840,7 +8730,7 @@ static int rtp_common_read(switch_rtp_t *rtp_session, switch_payload_t *payload_
 					}
 
 					if (bytes) {
-						if (switch_poll(rtp_session->read_pollfd, 1, &fdr, 0) == SWITCH_STATUS_SUCCESS) {
+						if (rtp_poll_input(rtp_session, 0) == SWITCH_STATUS_SUCCESS) {
 							rtp_session->hot_hits++;//+= rtp_session->samples_per_interval;
 
 							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG10, "%s Hot Hit %d\n",
@@ -7950,7 +8840,7 @@ static int rtp_common_read(switch_rtp_t *rtp_session, switch_payload_t *payload_
 				pt = 0;
 			}
 
-			poll_status = switch_poll(rtp_session->read_pollfd, 1, &fdr, pt);
+			poll_status = rtp_poll_input(rtp_session, pt);
 
 			if (rtp_session->flags[SWITCH_RTP_FLAG_VIDEO] && poll_status != SWITCH_STATUS_SUCCESS && rtp_session->media_timeout && rtp_session->last_media) {
 				check_timeout(rtp_session);
@@ -8039,6 +8929,104 @@ static int rtp_common_read(switch_rtp_t *rtp_session, switch_payload_t *payload_
 
 			}
 			poll_loop = 0;
+
+			/* C4B patch: Return CNG frame during DTLS handshake to unblock callers.
+			 *
+			 * Problem:
+			 * --------
+			 * When a WebRTC session (A leg) is in the originate/bridge loop
+			 * (switch_ivr_originate.c:~3368), the loop calls
+			 * switch_core_session_read_frame() on the A leg before checking
+			 * B leg channel status via check_channel_status(). This enters
+			 * rtp_common_read() here. During the DTLS handshake, ICE/STUN
+			 * binding requests arrive on the RTP socket. read_rtp_packet()
+			 * processes them (advancing the DTLS state machine via do_dtls())
+			 * but sets bytes=0 because they are not RTP data.
+			 *
+			 * Without this patch, rtp_common_read() never returns a frame:
+			 *
+			 *   1. poll succeeds (ICE/STUN packet) -> got_rtp_poll=1
+			 *   2. read_rtp_packet() handles ICE/DTLS -> bytes=0
+			 *   3. Existing CNG return (~line 7780) checks !got_rtp_poll
+			 *      -> false (poll succeeded) -> skipped
+			 *   4. RTCP_MUX path requires has_rtcp=1 -> skipped for ICE
+			 *   5. Loop continues -> never returns -> read_frame blocks
+			 *
+			 * Because read_frame never returns, the originate loop never
+			 * reaches check_channel_status(). If the B leg terminates for
+			 * any reason (callee rejects, busy, timeout, caller cancels),
+			 * the A leg caller stays stuck in "dialing" until the originate
+			 * timeout fires (30-60s).
+			 *
+			 * Affected scenario:
+			 * ------------------
+			 * WebRTC softphone (A leg) calls out via bridge/originate.
+			 * The B leg can be a SIP provider (sending 180 Ringing with SDP,
+			 * triggering early media and DTLS setup) or another softphone
+			 * (via B2Bua). Any B leg termination during the A leg's DTLS
+			 * handshake window triggers this bug.
+			 *
+			 * Typical reproduction: WebRTC client unreachable on its RTP
+			 * address (e.g. wrong network adapter), so DTLS never completes.
+			 * Callee declines -> caller stays stuck.
+			 *
+			 * Fix:
+			 * ----
+			 * Return a CNG (comfort noise) frame when:
+			 *   - DTLS is active but not yet ready (state != DS_READY)
+			 *   - No actual RTP bytes were received (!bytes)
+			 *   - Blocking I/O mode (same guard as other CNG returns)
+			 *   - No DTMF output in progress (same guard as other CNG returns)
+			 *
+			 * This unblocks read_frame, allowing the originate loop to call
+			 * check_channel_status() and detect B leg termination promptly.
+			 *
+			 * Safety:
+			 * -------
+			 * - CNG frames are returned in multiple other code paths in this
+			 *   function. All callers (originate, bridge, conference) handle
+			 *   them. The caller hears ringback, not the CNG frame.
+			 * - DTLS still progresses: do_dtls() runs inside read_rtp_packet()
+			 *   on every iteration BEFORE this point. The CNG return fires
+			 *   after the packet is fully processed.
+			 * - No impact on established calls: once DTLS completes
+			 *   (state == DS_READY), this condition stops matching.
+			 * - No impact on non-WebRTC calls: requires rtp_session->dtls
+			 *   to be set.
+			 * - media_timeout/rtp_timeout_sec do NOT help because ICE/STUN
+			 *   packets keep resetting the media timer.
+			 */
+			/* Snapshot DTLS presence and state under ice_mutex. rtp_session->dtls
+			 * can be freed concurrently by switch_rtp_del_dtls(), which holds
+			 * ice_mutex; reading ->state without the lock would be a use-after-free
+			 * race (see upstream "add missing ice_mutex to protect dtls"). */
+			{
+				int dtls_handshaking = 0;
+				dtls_state_t dtls_state_snap = DS_OFF;
+
+				switch_mutex_lock(rtp_session->ice_mutex);
+				if (!bytes && rtp_session->dtls && rtp_session->dtls->state != DS_READY) {
+					dtls_handshaking = 1;
+					dtls_state_snap = rtp_session->dtls->state;
+				}
+				switch_mutex_unlock(rtp_session->ice_mutex);
+
+				if (dtls_handshaking &&
+					(!(io_flags & SWITCH_IO_FLAG_NOBLOCK)) &&
+					(rtp_session->dtmf_data.out_digit_dur == 0)) {
+					/* Log only when the DTLS state actually changes, not on every read cycle: a
+					   stalled handshake would otherwise flood the log with thousands of identical
+					   lines (the state transitions themselves are logged separately by dtls_set_state). */
+					if (dtls_state_snap != rtp_session->cng_log_state) {
+						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG,
+							"C4B patch: returning CNG frame during DTLS handshake (dtls_state=%d, got_rtp_poll=%d)\n",
+							dtls_state_snap, got_rtp_poll);
+						rtp_session->cng_log_state = dtls_state_snap;
+					}
+					return_cng_frame();
+				}
+			}
+
 		} else {
 
 			if (!switch_rtp_ready(rtp_session)) {
@@ -8744,6 +9732,14 @@ static int rtp_write_ready(switch_rtp_t *rtp_session, uint32_t bytes, int line)
 		return 0;
 	}
 
+	/* C4B note: reads rtp_session->dtls->state WITHOUT ice_mutex. The dtls
+	   struct can be freed concurrently by switch_rtp_del_dtls() (which holds
+	   ice_mutex), so this is a latent use-after-free race. Deliberately left
+	   unlocked here: matches upstream (commit 1585ca7aaf locked only
+	   read_rtp_packet) and avoids a per-packet mutex in this hot path. A proper
+	   fix belongs upstream (refcount dtls, or keep it alive for the session
+	   lifetime). The one access C4B introduced was locked (originate CNG patch
+	   in rtp_common_read). */
 	if (rtp_session->dtls && rtp_session->dtls->state != DS_READY) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG3, "Skip sending %s packet %ld bytes (dtls not ready @ line %d!)\n",
 						  rtp_type(rtp_session), (long)bytes, line);
@@ -9181,11 +10177,15 @@ static int rtp_common_write(switch_rtp_t *rtp_session,
 				
 				if ((var = switch_channel_get_variable(channel, "rtp_nack_buffer_size"))) {
 					int tmp = atoi(var);
-					
-					if (tmp > 0 && tmp < 500) {
-						nack_size = tmp;
-					}
+					if (tmp <= 0)
+						tmp = 100;
+					else if (tmp > 1000)
+						tmp = 1000;
+					nack_size = tmp;
 				}
+
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_INFO,
+							  "NACK buffer size: %d\n", nack_size);
 
 				switch_jb_create(&rtp_session->vbw, SJB_VIDEO, nack_size, nack_size, rtp_session->pool);
 
@@ -9557,6 +10557,134 @@ SWITCH_DECLARE(switch_rtp_stats_t *) switch_rtp_get_stats(switch_rtp_t *rtp_sess
 	return s;
 }
 
+SWITCH_DECLARE(switch_bool_t) switch_rtp_has_ice(switch_rtp_t *rtp_session, ice_proto_t proto)
+{
+	switch_rtp_ice_t *ice;
+
+	if (!rtp_session) {
+		return SWITCH_FALSE;
+	}
+
+	ice = (proto == IPR_RTCP) ? &rtp_session->rtcp_ice : &rtp_session->ice;
+
+	return (ice->ice_user != NULL) ? SWITCH_TRUE : SWITCH_FALSE;
+}
+
+/* Copy one protocol's candidate list into the snapshot. icand_t is a fixed-size
+   struct, so the assignment freezes the scalar fields and the (pool-stable)
+   string pointers under the lock - no per-string duplication needed. */
+static void ice_snapshot_copy_cands(ice_t *src, int idx, icand_t *dst, int *count, int *chosen, int *is_chosen,
+									 const char **ufrag, const char **pwd)
+{
+	int i, n = 0;
+
+	if (!src) {
+		*count = 0;
+		*chosen = -1;
+		*is_chosen = 0;
+		*ufrag = NULL;
+		*pwd = NULL;
+		return;
+	}
+
+	n = src->cand_idx[idx];
+	if (n > MAX_CAND) {
+		n = MAX_CAND;
+	}
+	if (n < 0) {
+		n = 0;
+	}
+
+	for (i = 0; i < n; i++) {
+		dst[i] = src->cands[i][idx];
+	}
+
+	*count = n;
+	*chosen = src->chosen[idx];
+	*is_chosen = src->is_chosen[idx];
+	*ufrag = src->ufrag;
+	*pwd = src->pwd;
+}
+
+/* Let the signaling thread (switch_core_media.c) serialize its mutation of the media
+   engine's ice_in/ice_out arrays against this rtp_session's media thread, which reads
+   them under ice_mutex. NULL-safe: before media is running there is no rtp_session and
+   the call is a no-op. ice_mutex is nested, so re-locking within an already-locked path
+   (e.g. switch_rtp_activate_ice_v2) is safe. */
+SWITCH_DECLARE(void) switch_rtp_ice_lock(switch_rtp_t *rtp_session)
+{
+	if (rtp_session && rtp_session->ice_mutex) {
+		switch_mutex_lock(rtp_session->ice_mutex);
+	}
+}
+
+SWITCH_DECLARE(void) switch_rtp_ice_unlock(switch_rtp_t *rtp_session)
+{
+	if (rtp_session && rtp_session->ice_mutex) {
+		switch_mutex_unlock(rtp_session->ice_mutex);
+	}
+}
+
+SWITCH_DECLARE(switch_status_t) switch_rtp_get_ice_snapshot(switch_rtp_t *rtp_session, ice_proto_t proto, switch_rtp_ice_snapshot_t *snapshot)
+{
+	switch_rtp_ice_t *ice;
+	int idx = (proto == IPR_RTCP) ? 1 : 0;
+
+	if (!rtp_session || !snapshot) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	ice = (proto == IPR_RTCP) ? &rtp_session->rtcp_ice : &rtp_session->ice;
+
+	if (!ice->ice_user) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	switch_mutex_lock(rtp_session->ice_mutex);
+
+	memset(snapshot, 0, sizeof(*snapshot));
+
+	snapshot->enabled = 1;
+	snapshot->sending = ice->sending;
+	snapshot->ready = ice->ready;
+	snapshot->rready = ice->rready;
+	snapshot->initializing = ice->initializing;
+	snapshot->cand_responsive = ice->cand_responsive;
+	snapshot->controlled = (ice->type & ICE_CONTROLLED) ? 1 : 0;
+	snapshot->missed_count = ice->missed_count;
+	snapshot->last_ok = ice->last_ok;
+	snapshot->next_run = ice->next_run;
+	snapshot->tiebreaker = ice->tiebreaker;
+	snapshot->proto = proto;
+
+	snapshot->ice_user = ice->ice_user;
+	snapshot->user_ice = ice->user_ice;
+	snapshot->luser_ice = ice->luser_ice;
+
+	ice_snapshot_copy_cands(ice->ice_params, idx, snapshot->in_cands,
+							&snapshot->in_count, &snapshot->in_chosen, &snapshot->in_is_chosen,
+							&snapshot->in_ufrag, &snapshot->in_pwd);
+
+	ice_snapshot_copy_cands(ice->ice_params_out, idx, snapshot->out_cands,
+							&snapshot->out_count, &snapshot->out_chosen, &snapshot->out_is_chosen,
+							&snapshot->out_ufrag, &snapshot->out_pwd);
+
+	/* gen_ice() marks each local host candidate with .ready (one per media family under
+	   audio dual-stack) but never bumps cand_idx, so the count-based copy above yields
+	   nothing. Surface the ready host candidates explicitly (a full outgoing candidate
+	   list and RFC 8445 candidate pairs are not maintained by the core yet). */
+	if (snapshot->out_count == 0 && ice->ice_params_out) {
+		int oc;
+		for (oc = 0; oc < MAX_CAND && ice->ice_params_out->cands[oc][idx].ready; oc++) {
+			snapshot->out_cands[snapshot->out_count++] = ice->ice_params_out->cands[oc][idx];
+		}
+	}
+
+	switch_mutex_unlock(rtp_session->ice_mutex);
+
+	return SWITCH_STATUS_SUCCESS;
+}
+
 SWITCH_DECLARE(int) switch_rtp_write_manual(switch_rtp_t *rtp_session,
 											void *data, uint32_t datalen, uint8_t m, switch_payload_t payload, uint32_t ts, switch_frame_flag_t *flags)
 {
@@ -9691,6 +10819,115 @@ SWITCH_DECLARE(void *) switch_rtp_get_private(switch_rtp_t *rtp_session)
 SWITCH_DECLARE(switch_core_session_t*) switch_rtp_get_core_session(switch_rtp_t *rtp_session)
 {
 	return rtp_session->session;
+}
+
+typedef struct candidate_sort_s {
+	uint32_t prio_or_index;
+	int index;
+} candidate_sort_t;
+
+static int sort_candidates_compare(const void *p, const void *q)
+{
+	const candidate_sort_t *pp = (const candidate_sort_t *)p;
+	const candidate_sort_t *qq = (const candidate_sort_t *)q;
+
+	if (qq->prio_or_index != pp->prio_or_index) {
+		return (qq->prio_or_index > pp->prio_or_index) - (qq->prio_or_index < pp->prio_or_index);   /* priority descending, no subtraction overflow */
+	}
+	return (pp->index > qq->index) - (pp->index < qq->index);   /* equal priority: keep original order (stable) */
+}
+
+SWITCH_DECLARE(switch_status_t) switch_rtp_ice_sort_candidates(ice_t *ice_params, ice_proto_t proto)
+{
+	int i;
+	uint32_t prio = UINT32_MAX;
+	int sorted = 1;
+
+	if (ice_params == NULL) {
+		return SWITCH_STATUS_NOOP;
+	}
+	
+	// fast check
+	for (i = 0; i < ice_params->cand_idx[proto]; i++) {
+		if (ice_params->cands[i][proto].priority > prio) {
+			sorted = 0;
+			break;
+		}
+		prio = ice_params->cands[i][proto].priority;
+	}
+
+	if (sorted) { 
+		return SWITCH_STATUS_FALSE;
+	} else {
+		candidate_sort_t sort[MAX_CAND];
+		int index, j;
+		icand_t cand;
+
+		sorted = 0;
+
+		for (i = 0; i < ice_params->cand_idx[proto]; i++) {
+			sort[i].prio_or_index = ice_params->cands[i][proto].priority;
+			sort[i].index = i;
+		}
+
+		qsort(&sort[0], ice_params->cand_idx[proto], sizeof(candidate_sort_t), sort_candidates_compare);
+
+		// initialize index mapping for ordering 
+		for (i = 0; i < ice_params->cand_idx[proto]; i++) { 
+			sort[i].prio_or_index = i; 
+		}
+
+		// ordering of data
+		for (i = 0; i < ice_params->cand_idx[proto]; i++) {
+			// convert requested index to current index
+			index = (int)sort[sort[i].index].prio_or_index;
+			if (i != index) {
+				// exchange cand i <-> index
+				cand = ice_params->cands[i][proto];
+				ice_params->cands[i][proto] = ice_params->cands[index][proto];
+				ice_params->cands[index][proto] = cand;
+
+				sorted++;
+				// update current index for both candidates
+				for (j = 0; j < ice_params->cand_idx[proto]; j++) {
+					if ((int)sort[j].prio_or_index == i) {
+						sort[j].prio_or_index = index;
+						sorted--;
+						break;
+					}
+				}
+				sort[sort[i].index].prio_or_index = i;
+			}
+		}
+
+		/* Convert chosen to its position in the sorted list. sort[i].index is the OLD
+		   index of the candidate now at position i, so the new position of the old
+		   chosen candidate is the i where sort[i].index == old chosen (the inverse of
+		   the permutation; reading sort[chosen].index applies the permutation the wrong
+		   way and only happens to work for self-inverse permutations). Remap only when a
+		   candidate was actually chosen, so an unset chosen[proto] stays 0 instead of
+		   becoming a random index. */
+		if (ice_params->is_chosen[proto]) {
+			int old_chosen = ice_params->chosen[proto];
+			for (i = 0; i < ice_params->cand_idx[proto]; i++) {
+				if (sort[i].index == old_chosen) {
+					ice_params->chosen[proto] = i;
+					break;
+				}
+			}
+		}
+
+		// validation of ordering, sorted should be 0
+		if (sorted) {
+			/* Unreachable with correct permutation logic; if it ever triggers, the list
+			   is partially permuted - drop any selection for this component so the caller
+			   falls back to safe defaults instead of trusting a stale chosen index. */
+			ice_params->chosen[proto] = 0;
+			ice_params->is_chosen[proto] = 0;
+			return SWITCH_STATUS_GENERR;
+		}
+	}
+	return SWITCH_STATUS_SUCCESS;
 }
 
 /* For Emacs:

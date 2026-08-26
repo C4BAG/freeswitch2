@@ -37,6 +37,28 @@
 #ifndef FREESWITCH_STUN_PARSER_H
 #define FREESWITCH_STUN_PARSER_H
 
+/*
+ * 64-bit network byte-order helpers for the ICE tiebreaker (RFC 8445). winsock2.h
+ * provides htonll/ntohll on Windows; glibc and most other platforms do not, so
+ * provide a portable fallback built from the 32-bit htonl to keep this a
+ * cross-platform build. Only the plain-variable call sites in switch_stun.c
+ * and switch_rtp.c use these, so the macro arg is never a side-effecting
+ * expression.
+ */
+#ifndef _WIN32
+#include <arpa/inet.h>
+#ifndef htonll
+/* htonl(1) == 1 only on a big-endian host, where the conversion is the identity.
+   The compiler folds the test away. Without it the swap below would exchange the
+   two 32-bit halves there instead of doing nothing. */
+#define htonll(x) (htonl(1) == 1 ? (uint64_t)(x) \
+	: ((((uint64_t)htonl((uint32_t)((x) & 0xFFFFFFFFULL))) << 32) | htonl((uint32_t)((x) >> 32))))
+#endif
+#ifndef ntohll
+#define ntohll(x) htonll(x)
+#endif
+#endif
+
 SWITCH_BEGIN_EXTERN_C
 #define SWITCH_STUN_DEFAULT_PORT 3478
 #define SWITCH_STUN_PACKET_MIN_LEN 20
@@ -178,6 +200,11 @@ typedef struct {
 */
 SWITCH_DECLARE(void) switch_stun_random_string(char *buf, uint16_t len, char *set);
 
+/*
+  \brief Generate a random value for tiebreaker RFC 8445 "64bit unsigned integer"
+ */
+SWITCH_DECLARE(uint64_t) switch_stun_random_tiebreaker(void);
+
 /*!
   \brief Prepare a raw packet for parsing
   \param buf the raw data
@@ -263,9 +290,10 @@ SWITCH_DECLARE(switch_status_t) switch_stun_packet_verify_integrity(const uint8_
 SWITCH_DECLARE(uint32_t) switch_crc32_8bytes(const void* data, size_t length);
 SWITCH_DECLARE(uint8_t) switch_stun_packet_attribute_add_fingerprint(switch_stun_packet_t *packet);
 SWITCH_DECLARE(uint8_t) switch_stun_packet_attribute_add_use_candidate(switch_stun_packet_t *packet);
-SWITCH_DECLARE(uint8_t) switch_stun_packet_attribute_add_controlling(switch_stun_packet_t *packet);
-SWITCH_DECLARE(uint8_t) switch_stun_packet_attribute_add_controlled(switch_stun_packet_t *packet);
+SWITCH_DECLARE(uint8_t) switch_stun_packet_attribute_add_controlling(switch_stun_packet_t *packet, uint64_t tiebreaker);
+SWITCH_DECLARE(uint8_t) switch_stun_packet_attribute_add_controlled(switch_stun_packet_t *packet, uint64_t tiebreaker);
 SWITCH_DECLARE(uint8_t) switch_stun_packet_attribute_add_priority(switch_stun_packet_t *packet, uint32_t priority);
+SWITCH_DECLARE(uint8_t) switch_stun_packet_attribute_add_error(switch_stun_packet_t *packet, uint32_t code, char *reason);
 
 /*!
   \brief Perform a stun lookup
@@ -277,8 +305,33 @@ SWITCH_DECLARE(uint8_t) switch_stun_packet_attribute_add_priority(switch_stun_pa
   \param pool the memory pool to use
   \return SUCCESS or FAIL
 */
-SWITCH_DECLARE(switch_status_t) switch_stun_lookup(char **ip,
-												   switch_port_t *port, char *stunip, switch_port_t stunport, char **err, switch_memory_pool_t *pool);
+SWITCH_DECLARE(switch_status_t) switch_stun_lookup(char **ip, switch_port_t *port, char *stunip, switch_port_t stunport, char **err, switch_memory_pool_t *pool);
+
+/*!
+  \brief Perform a stun lookup
+  \param ip the local ip v6 to use (replaced with stun results)
+  \param port the local port to use (replaced with stun results)
+  \param stunip the ip v6 or name of the stun server
+  \param stunport the port of the stun server
+  \param err a pointer to describe errors
+  \param pool the memory pool to use
+  \return SUCCESS or FAIL
+*/
+SWITCH_DECLARE(switch_status_t) switch_stun_lookup_ipv6(char **ip, switch_port_t *port, char *stunip, switch_port_t stunport, char **err, switch_memory_pool_t *pool);
+
+/*!
+  \brief Perform a stun lookup
+  \param family for ip v4 or v6
+  \param ip the local ip v4 or v6 to use (replaced with stun results)
+  \param port the local port to use (replaced with stun results)
+  \param stunip the ip ip v4 or v6 or name of the stun server
+  \param stunport the port of the stun server
+  \param err a pointer to describe errors
+  \param pool the memory pool to use
+  \return SUCCESS or FAIL
+*/
+SWITCH_DECLARE(switch_status_t) switch_stun_lookup_ipv4v6(int32_t family, char **ip, switch_port_t *port, char *stunip, switch_port_t stunport, char **err, switch_memory_pool_t *pool);
+
 
 /*!
   \brief Perform a stun ip lookup

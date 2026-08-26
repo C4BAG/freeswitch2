@@ -207,6 +207,7 @@ SWITCH_BEGIN_EXTERN_C
 #define SWITCH_ORIGINATOR_VIDEO_CODEC_VARIABLE "originator_video_codec"
 #define SWITCH_LOCAL_MEDIA_IP_VARIABLE "local_media_ip"
 #define SWITCH_LOCAL_MEDIA_PORT_VARIABLE "local_media_port"
+#define SWITCH_LOCAL_MEDIA_IP_LIST_VARIABLE "local_media_ip_list"
 #define SWITCH_ADVERTISED_MEDIA_IP_VARIABLE "advertised_media_ip"
 #define SWITCH_REMOTE_MEDIA_IP_VARIABLE "remote_media_ip"
 #define SWITCH_REMOTE_MEDIA_PORT_VARIABLE "remote_media_port"
@@ -2746,7 +2747,9 @@ typedef enum {
 	ICE_GOOGLE_JINGLE = (1 << 0),
 	ICE_VANILLA = (1 << 1),
 	ICE_CONTROLLED = (1 << 2),
-	ICE_LITE = (1 << 3)
+	ICE_LITE = (1 << 3),
+	ICE_DISABLE_DTLS_PROTECTION = (1 << 4),
+	ICE_NOMINATION = (1 << 5)
 } switch_core_media_ice_type_t;
 
 typedef enum {

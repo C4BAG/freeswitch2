@@ -188,6 +188,8 @@ static inline const char *switch_media_type2str(switch_media_type_t type)
 		return "audio";
 	case SWITCH_MEDIA_TYPE_VIDEO:
 		return "video";
+	case SWITCH_MEDIA_TYPE_TEXT:
+		return "text";
 	default:
 		return "!ERR";
 
@@ -273,6 +275,8 @@ SWITCH_DECLARE(void) switch_core_media_set_rtp_flag(switch_core_session_t *sessi
 SWITCH_DECLARE(void) switch_core_media_clear_rtp_flag(switch_core_session_t *session, switch_media_type_t type, switch_rtp_flag_t flag);
 SWITCH_DECLARE(switch_jb_t *) switch_core_media_get_jb(switch_core_session_t *session, switch_media_type_t type);
 SWITCH_DECLARE(switch_rtp_stats_t *) switch_core_media_get_stats(switch_core_session_t *session, switch_media_type_t type, switch_memory_pool_t *pool);
+SWITCH_DECLARE(switch_bool_t) switch_core_media_has_ice(switch_core_session_t *session, switch_media_type_t type, ice_proto_t proto);
+SWITCH_DECLARE(switch_status_t) switch_core_media_get_ice_snapshot(switch_core_session_t *session, switch_media_type_t type, ice_proto_t proto, switch_rtp_ice_snapshot_t *snapshot);
 
 
 SWITCH_DECLARE(void) switch_core_media_set_sdp_codec_string(switch_core_session_t *session, const char *r_sdp, switch_sdp_type_t sdp_type);
@@ -285,6 +289,7 @@ SWITCH_DECLARE(void) switch_core_media_check_outgoing_proxy(switch_core_session_
 SWITCH_DECLARE(switch_status_t) switch_core_media_codec_chosen(switch_core_session_t *session, switch_media_type_t media);
 SWITCH_DECLARE (void) switch_core_media_recover_session(switch_core_session_t *session);
 SWITCH_DECLARE(switch_status_t) switch_core_media_add_ice_acl(switch_core_session_t *session, switch_media_type_t type, const char *acl_name);
+SWITCH_DECLARE(switch_status_t) switch_core_media_check_ice_acl(switch_core_session_t *session, switch_media_type_t type, const char *addr);
 SWITCH_DECLARE(void) switch_core_session_set_ice(switch_core_session_t *session);
 SWITCH_DECLARE(void) switch_core_media_clear_ice(switch_core_session_t *session);
 SWITCH_DECLARE(void) switch_core_media_pause(switch_core_session_t *session);
