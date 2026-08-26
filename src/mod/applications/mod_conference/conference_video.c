@@ -521,6 +521,16 @@ static switch_status_t conference_video_autoscale(mcu_layer_t *layer, switch_ima
 	source = ximg ? ximg : layer->cur_img;
 	conference = layer->canvas->conference;
 
+	/* Same guard as conference_video_scale_and_patch() a few lines below: the caller
+	   may pass ximg == NULL and layer->cur_img can be NULL too. Returning FALSE lets
+	   conference_handle_video() fall through to that function, which handles the case
+	   itself - exactly what happens today when auto-size is off. switch_img_patch()
+	   dereferences its arguments without checking. */
+	if (!source) {
+		switch_mutex_unlock(layer->canvas->mutex);
+		return SWITCH_STATUS_FALSE;
+	}
+
 	new_w = source->d_w;
 	new_h = source->d_h;
 
@@ -528,16 +538,30 @@ static switch_status_t conference_video_autoscale(mcu_layer_t *layer, switch_ima
 	if ((new_h % 2) != 0) new_h++;
 
 	if (new_w != layer->canvas->width || new_h != layer->canvas->height) {
+		/* Allocate first, swap second: the size is dictated by the presenter, so the
+		   allocation can genuinely fail. Freeing the old image before knowing the new
+		   one exists would leave canvas->img NULL with the dimensions already updated,
+		   and switch_img_patch() below dereferences it without checking. On failure
+		   nothing has changed and the caller falls back to the regular path. */
+		switch_image_t *new_img = switch_img_alloc(NULL, SWITCH_IMG_FMT_I420, new_w, new_h, 0);
+
+		if (!new_img) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+				"Conference %s: cannot allocate a %dx%d canvas, staying at %dx%d\n",
+				conference->name, new_w, new_h, layer->canvas->width, layer->canvas->height);
+			switch_mutex_unlock(layer->canvas->mutex);
+			return SWITCH_STATUS_FALSE;
+		}
 
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
 			"Conference %s: Auto-resizing canvas %dx%d -> %dx%d\n",
 			conference->name,
 			layer->canvas->width, layer->canvas->height, new_w, new_h);
 
+		switch_img_free(&layer->canvas->img);
+		layer->canvas->img = new_img;
 		layer->canvas->width = new_w;
 		layer->canvas->height = new_h;
-		switch_img_free(&layer->canvas->img);
-		layer->canvas->img = switch_img_alloc(NULL, SWITCH_IMG_FMT_I420, layer->canvas->width, layer->canvas->height, 0);
 
 		conference->canvas_width = new_w;
 		conference->canvas_height = new_h;
