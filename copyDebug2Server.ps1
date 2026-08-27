@@ -3,4 +3,4 @@ param (
     [string]$Branch
 )
 
-.\copybuild2server.ps1 -Configuration "Debug" -Branch $branch
+& "$PSScriptRoot\copybuild2Server.ps1" -Configuration "Debug" -Branch $Branch
