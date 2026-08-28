@@ -1,0 +1,7 @@
+# Ignore everything (build output, packages)
+*
+# Exceptions: script and .gitignore
+!.gitignore
+!.gitattributes
+!build-debs.ps1
+!in-container-build.sh

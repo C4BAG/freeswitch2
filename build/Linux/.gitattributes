@@ -1,0 +1,6 @@
+# in-container-build.sh is bind-mounted into the container straight from the working
+# copy, not taken from the build context, so it has to stay LF here as well. The
+# repository root .gitattributes covers .c, .h and .txt but not .sh, and with
+# core.autocrlf=true a checkout would otherwise hand the container a CRLF shebang -
+# "bad interpreter", which is the very failure this tooling exists to avoid.
+*.sh text eol=lf
