@@ -4,7 +4,21 @@ MANAGED_DIR=$(switch_srcdir)/src/mod/languages/mod_managedcore/managed
 
 # Make these come from pkg-config or autoconf dependency detection later
 COREHOST_LIB = libnethost.so
-COREHOST_PATH = /usr/share/dotnet/packs/Microsoft.NETCore.App.Host.linux-x64/10.0.10/runtimes/linux-x64/native
+COREHOST_RID ?= linux-x64
+COREHOST_PACKS ?= /usr/share/dotnet/packs/Microsoft.NETCore.App.Host.$(COREHOST_RID)
+
+# The path used to name one host-pack version outright, and broke as soon as a
+# different SDK was installed - the Debian build gets 10.0.400 where this said
+# 10.0.10, and make then reports only 'No rule to make target .../libnethost.so'.
+# Take the newest pack that is actually installed, overridable the same way
+# DotNetHostVersion is on the Windows side.
+COREHOST_VERSION ?= $(notdir $(lastword $(sort $(wildcard $(COREHOST_PACKS)/*))))
+
+# Not an 'ifeq' guard: automake owns the if/endif keywords at line start and
+# rejects them with 'endif without if'. Expanding the check inside the variable
+# also reports it only when the module is really built.
+COREHOST_CHECKED = $(or $(COREHOST_VERSION),$(error no .NET host pack under $(COREHOST_PACKS) - install the .NET SDK or set COREHOST_VERSION))
+COREHOST_PATH = $(COREHOST_PACKS)/$(COREHOST_CHECKED)/runtimes/$(COREHOST_RID)/native
 COREHOST_CFLAGS = -I$(COREHOST_PATH) -L$(COREHOST_PATH)
 COREHOST_LDFLAGS = -lnethost
 
