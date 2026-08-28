@@ -1503,7 +1503,7 @@ static void handle_ice(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice, void *d
 					memcpy(&tiebreaker, attr->value, sizeof(tiebreaker));
 					controlling_controlled = attr->type;
 					controlling_controlled_tiebreaker = ntohll(tiebreaker);
-					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG8, "|------: tiebreaker: %llu\n", controlling_controlled_tiebreaker);
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG8, "|------: tiebreaker: %" SWITCH_UINT64_T_FMT "\n", controlling_controlled_tiebreaker);
 				} else {
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "%s STUN ICE-CONTROLL* attribute too short (%u bytes), ignored\n", rtp_type(rtp_session), attr->length);
 				}
