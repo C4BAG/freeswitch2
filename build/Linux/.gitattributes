@@ -4,3 +4,8 @@
 # core.autocrlf=true a checkout would otherwise hand the container a CRLF shebang -
 # "bad interpreter", which is the very failure this tooling exists to avoid.
 *.sh text eol=lf
+
+# Same reasoning for the Dockerfile. It is copied into the build context from the
+# working copy, and a CRLF checkout puts a stray carriage return at the end of every
+# continued line of a RUN command.
+Dockerfile text eol=lf

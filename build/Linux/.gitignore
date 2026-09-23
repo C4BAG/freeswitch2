@@ -5,3 +5,5 @@
 !.gitattributes
 !build-debs.ps1
 !in-container-build.sh
+!xcc-dev/
+!xcc-dev/**
