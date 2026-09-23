@@ -7,3 +7,5 @@
 !in-container-build.sh
 !xcc-dev/
 !xcc-dev/**
+!xcc-vm/
+!xcc-vm/**
