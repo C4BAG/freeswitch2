@@ -139,6 +139,24 @@ if ($missing.Count) {
     throw "$($missing.Count) of $($files.Count) files are not in the build. Nothing was copied."
 }
 
+# An XCC tree is more than the build output. Configuration, sounds, Lua scripts and the
+# managed plugin come from elsewhere - source control, and the XCC project's bin_Core -
+# and a new target directory is normally seeded by copying an existing deployment.
+# Warn about what is absent, but do not stop: deploying binaries into a tree that is
+# still being assembled is legitimate, and refusing would only get in the way.
+$expected = [ordered]@{
+    'conf'            = 'configuration, including c4bvars.xml'
+    'sounds'          = 'sound files'
+    'scripts'         = 'Lua scripts'
+    'mod\managedcore' = 'the C4B plugin, from the XCC project'
+}
+$absent = @($expected.Keys | Where-Object { -not (Test-Path -LiteralPath (Join-Path $xccPath $_) -PathType Container) })
+if ($absent.Count) {
+    Write-Warning "Not present in $xccPath - this script does not create them:"
+    $absent | ForEach-Object { Write-Warning "  $($_.PadRight(16)) $($expected[$_])" }
+    Write-Warning "FreeSWITCH will not start without them. Seed the tree from an existing deployment."
+}
+
 # With -KeepReadOnly the write protection of the target is source control's business,
 # not this script's. Report and stop so the files can be checked out properly.
 if ($KeepReadOnly) {
