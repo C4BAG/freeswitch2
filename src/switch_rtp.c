@@ -70,6 +70,9 @@
 #define WRITE_DEC(rtp_session) rtp_session->writing--; switch_mutex_unlock(rtp_session->write_mutex)
 
 #define RTP_STUN_FREQ 1000000
+/* How long a media::no_media report stands for, and so how often one is sent while the outage
+   lasts. Overridden per call by the no_media_report_ms channel variable; 0 turns reporting off. */
+#define RTP_NO_MEDIA_REPORT_MS 15000
 #define rtp_header_len 12
 #define RTP_START_PORT 16384
 #define RTP_END_PORT 32768
@@ -467,6 +470,8 @@ struct switch_rtp {
 	char from_host_str[50];
 	switch_time_t first_stun;
 	switch_time_t last_stun;
+	switch_time_t last_no_media_report;
+	uint32_t no_media_report_ms;
 	uint32_t samples_per_interval;
 	uint32_t samples_per_second;
 	uint32_t conf_samples_per_interval;
@@ -1176,6 +1181,7 @@ static switch_status_t ice_out(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice,
 	uint8_t buf[256] = { 0 };
 	switch_stun_packet_t *packet;
 	unsigned int elapsed;
+	unsigned int since_report;
 	switch_size_t bytes;
 	switch_status_t status = SWITCH_STATUS_SUCCESS;
 	//switch_sockaddr_t *remote_addr = rtp_session->remote_addr;
@@ -1219,19 +1225,30 @@ static switch_status_t ice_out(switch_rtp_t *rtp_session, switch_rtp_ice_t *ice,
 
 	READ_INC(rtp_session);
 
-	if (rtp_session->last_stun) {
+	if (rtp_session->last_stun && rtp_session->no_media_report_ms) {
+		/* last_stun answers one question only - when did a STUN message last arrive - and handle_ice
+		   is its only writer. The repeat brake keeps its own timestamp, so the outage duration stays
+		   true however often this has already been reported. */
 		elapsed = (unsigned int) ((switch_micro_time_now() - rtp_session->last_stun) / 1000);
+		since_report = rtp_session->last_no_media_report
+			? (unsigned int) ((switch_micro_time_now() - rtp_session->last_no_media_report) / 1000)
+			: elapsed;
 
-		if (elapsed > 30000) {
+		if (elapsed > rtp_session->no_media_report_ms && since_report > rtp_session->no_media_report_ms) {
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING, "No %s stun for a long time!\n", rtp_type(rtp_session));
-			rtp_session->last_stun = switch_micro_time_now();
-			
+			rtp_session->last_no_media_report = switch_micro_time_now();
+
 			channel = switch_core_session_get_channel(rtp_session->session);
 			if (channel && switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, "media::no_media") == SWITCH_STATUS_SUCCESS)
 			{
 				switch_channel_event_set_data(channel, event);
 				switch_event_add_header(event, SWITCH_STACK_BOTTOM, "Media-Type", "%s", rtp_type(rtp_session));
-				switch_event_add_header(event, SWITCH_STACK_BOTTOM, "Media-No-Media-Ms", "%d", elapsed);
+				/* Unchanged: the interval since the previous report, which is what last_stun used to
+				   yield once the brake had overwritten it. Media-No-Media-Total-Ms is the new value -
+				   the whole outage so far - for consumers that want to compare against a threshold
+				   instead of adding up reports. */
+				switch_event_add_header(event, SWITCH_STACK_BOTTOM, "Media-No-Media-Ms", "%d", since_report);
+				switch_event_add_header(event, SWITCH_STACK_BOTTOM, "Media-No-Media-Total-Ms", "%d", elapsed);
 				switch_event_fire(&event);
 			}
 
@@ -3716,6 +3733,17 @@ SWITCH_DECLARE(void) switch_rtp_set_media_timeout(switch_rtp_t *rtp_session, uin
 	switch_rtp_reset_media_timer(rtp_session);
 }
 
+SWITCH_DECLARE(void) switch_rtp_set_no_media_report_ms(switch_rtp_t *rtp_session, uint32_t ms)
+{
+	if (!switch_rtp_ready(rtp_session)) {
+		return;
+	}
+
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_DEBUG1,
+					  "%s NO MEDIA REPORT %s set to %u\n", switch_core_session_get_name(rtp_session->session), rtp_type(rtp_session), ms);
+	rtp_session->no_media_report_ms = ms;
+}
+
 SWITCH_DECLARE(void) switch_rtp_set_max_missed_packets(switch_rtp_t *rtp_session, uint32_t max)
 {
 	if (!switch_rtp_ready(rtp_session) || rtp_session->flags[SWITCH_RTP_FLAG_UDPTL]) {
@@ -3764,6 +3792,7 @@ SWITCH_DECLARE(void) switch_rtp_reset(switch_rtp_t *rtp_session)
 	memset(&rtp_session->ts_norm, 0, sizeof(rtp_session->ts_norm));
 
 	rtp_session->last_stun = rtp_session->first_stun = 0;
+	rtp_session->last_no_media_report = 0;
 	rtp_session->rtcp_sent_packets = 0;
 	rtp_session->rtcp_last_sent = 0;
 	rtp_session->last_adj = 0;
@@ -5391,6 +5420,7 @@ SWITCH_DECLARE(switch_status_t) switch_rtp_create(switch_rtp_t **new_rtp_session
 	rtp_session->recv_te = INVALID_PT;
 	rtp_session->cng_pt = INVALID_PT;
 	rtp_session->session = session;
+	rtp_session->no_media_report_ms = RTP_NO_MEDIA_REPORT_MS;
 
 	switch_mutex_init(&rtp_session->flag_mutex, SWITCH_MUTEX_NESTED, pool);
 	switch_mutex_init(&rtp_session->read_mutex, SWITCH_MUTEX_NESTED, pool);

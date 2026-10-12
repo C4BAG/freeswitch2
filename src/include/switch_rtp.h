@@ -335,6 +335,14 @@ SWITCH_DECLARE(void) switch_rtp_reset_media_timer(switch_rtp_t *rtp_session);
 SWITCH_DECLARE(void) switch_rtp_set_max_missed_packets(switch_rtp_t *rtp_session, uint32_t max);
 SWITCH_DECLARE(void) switch_rtp_set_media_timeout(switch_rtp_t *rtp_session, uint32_t ms);
 
+/*!
+  \brief Set how long a media::no_media report stands for, and so how often one is sent while an
+         outage lasts. 0 turns the reporting off.
+  \param rtp_session the RTP session
+  \param ms the reporting interval in milliseconds
+*/
+SWITCH_DECLARE(void) switch_rtp_set_no_media_report_ms(switch_rtp_t *rtp_session, uint32_t ms);
+
 SWITCH_DECLARE(switch_status_t) switch_rtp_udptl_mode(switch_rtp_t *rtp_session);
 SWITCH_DECLARE(void) switch_rtp_reset(switch_rtp_t *rtp_session);
 

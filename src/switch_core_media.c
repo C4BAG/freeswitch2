@@ -2745,6 +2745,13 @@ static void check_media_timeout_params(switch_core_session_t *session, switch_rt
 		engine->media_timeout = atoi(val);
 	}
 
+	/* Not a timeout of its own: how often media::no_media reports an outage that is already
+	   running, and so the resolution a consumer of that event can work with. */
+	if (switch_rtp_ready(engine->rtp_session) && (val = switch_channel_get_variable(session->channel, "no_media_report_ms"))) {
+		int ms = atoi(val);
+		switch_rtp_set_no_media_report_ms(engine->rtp_session, ms > 0 ? (uint32_t) ms : 0);
+	}
+
 	if (type == SWITCH_MEDIA_TYPE_VIDEO) {
 		if ((val = switch_channel_get_variable(session->channel, "media_hold_timeout_video"))) {
 			engine->media_hold_timeout = atoi(val);
