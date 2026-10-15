@@ -546,6 +546,7 @@ struct switch_rtp {
 	cusum_kalman_detector_t *detectors[KALMAN_SYSTEM_MODELS];
 	switch_time_t last_adj;
 	switch_time_t adj_window;
+	switch_time_t last_ice_cand_drop_log;   /* rate limit for the "media dropped from a known ICE candidate" warning */
 	uint32_t elapsed_stun;
 	uint32_t elapsed_media;
 	uint32_t elapsed_adj;
@@ -6940,6 +6941,57 @@ static int get_recv_payload(switch_rtp_t *rtp_session)
 	return r;
 }
 
+/* Dropping media because it came from somewhere other than the send target is silent today:
+   inject_dos only counts, and the RTP alert threshold is 40000 pps while a voice stream runs
+   at 50. The one case worth a line is a source the peer itself signalled as an ICE candidate,
+   because that is a candidate switch we are not following - either because the session is not
+   in nomination mode, or because the candidate has not been nominated (yet).
+
+   Rate-limited to one line per second, and the candidate lookup runs only when that budget
+   allows, so a genuine flood does not pay for the scan. */
+static void rtp_log_ice_cand_media_drop(switch_rtp_t *rtp_session)
+{
+	char host[80] = "";
+	switch_port_t port;
+	switch_time_t now = switch_time_now();
+	switch_rtp_ice_t *ice = &rtp_session->ice;
+	uint8_t use_candidate = 0, responsive = 0;
+	char acl_passed = 0;
+	int i;
+
+	if (!using_ice(rtp_session) || now - rtp_session->last_ice_cand_drop_log < 1000000) {
+		return;
+	}
+
+	switch_get_addr(host, sizeof(host), rtp_session->from_addr);
+	port = switch_sockaddr_get_port(rtp_session->from_addr);
+
+	switch_mutex_lock(rtp_session->ice_mutex);
+
+	if (ice->ice_params && (i = switch_rtp_ice_find_candidate(ice, host, &port)) >= 0) {
+		use_candidate = ice->ice_params->cands[i][ice->proto].use_candidate;
+		responsive = ice->ice_params->cands[i][ice->proto].responsive;
+		acl_passed = ice->ice_params->cands[i][ice->proto].acl_passed;
+	} else {
+		i = -1;
+	}
+
+	switch_mutex_unlock(rtp_session->ice_mutex);
+
+	if (i < 0) {
+		return;   /* unknown source - that is what the inject DoS counters are for */
+	}
+
+	rtp_session->last_ice_cand_drop_log = now;
+
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session), SWITCH_LOG_WARNING,
+						"Dropping %s media from ICE candidate idx:%d [%s:%d], it is not the send target "
+						"(nomination: %s, use_candidate: %d, responsive: %d, acl_passed: %s)\n",
+						rtp_type(rtp_session), i, host, port,
+						ice_nomination_active(ice) ? "active" : "off",
+						use_candidate, responsive, ACL_PASSED_TO_BOOL_STR(acl_passed));
+}
+
 static void switch_rtp_inject_dos_alert_log(switch_rtp_t *rtp_session, switch_rtp_inject_dos_packet_t *packet)
 {
 	char host[100] = { 0 };
@@ -7361,6 +7413,7 @@ static switch_status_t read_rtp_packet(switch_rtp_t *rtp_session, switch_size_t 
 						* switch_rtp_media_observe eventually records the new candidate.
 						**/
 					packet = rtp_session->has_rtp ? &rtp_session->inject_dos.rtp : &rtp_session->inject_dos.rtcp;
+					rtp_log_ice_cand_media_drop(rtp_session);
 					switch_rtp_inject_dos_check(rtp_session, packet, SWITCH_FALSE);
 					switch_rtp_inject_dos_wipe_recv_msg(rtp_session, bytes);
 
