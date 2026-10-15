@@ -876,6 +876,59 @@ static int switch_rtp_ice_find_candidate_nominated(switch_rtp_t *rtp_session, sw
 	return idx;
 }
 
+/* Phase 2, receive side: may we accept media that arrived from an address other than the
+   current send target? Yes exactly when the source is a peer-nominated ICE candidate
+   (USE-CANDIDATE + ICE-ACL + STUN-fresh, see switch_rtp_ice_is_candidate_nominated).
+
+   This is the RTP counterpart of dtls_validated_ice_cand_idx. DTLS already survives a
+   candidate switch that way, for the reason stated there: the peer keeps re-optimizing the
+   selected pair, so binding acceptance to the single current ice->addr drops whatever the
+   peer has already moved on to. RTP had no such exemption, and that starves the hand-over
+   itself: media_rcv_last is written only by the DTLS path and by switch_rtp_media_observe
+   after a successful SRTP decrypt, and the second one sits behind the very drop in question.
+   A candidate therefore could not become the send target until it carried media, and its
+   media was not accepted until it was the send target. Once DTLS had completed on the old
+   pair there was no observation point left and the leg stayed deaf for good.
+
+   Accepting here re-points nothing. The packet merely stays on the regular read path, where
+   SRTP still has to authenticate it and switch_rtp_media_observe only records which candidate
+   it came from; the hand-over decision stays in handle_ice under the write->ice lock order.
+   Takes ice_mutex itself - the read path holds no ICE lock at this point (and the mutex is
+   SWITCH_MUTEX_NESTED in any case).
+
+   Self-gated to controlled + nomination + rtcp-mux, the same scope as the rest of the Phase 2
+   machinery, so a session that does not run it keeps the legacy behaviour untouched.
+
+   On the trust level the same reasoning applies as for DTLS: the barrier is the IP-ACL plus
+   the 5-tuple match plus SRTP authentication, not ICE credentials, and an off-path sender who
+   could forge its way past this one could already forge its way past dtls_validated_ice_cand_idx. */
+static int rtp_from_nominated_ice_cand(switch_rtp_t *rtp_session)
+{
+	switch_rtp_ice_t *ice = &rtp_session->ice;
+	char host[80] = "";
+	switch_port_t port;
+	int i, nominated = 0;
+
+	if (!ice_nomination_active(ice) || !rtp_session->flags[SWITCH_RTP_FLAG_RTCP_MUX]) {
+		return 0;
+	}
+
+	switch_get_addr(host, sizeof(host), rtp_session->from_addr);
+	port = switch_sockaddr_get_port(rtp_session->from_addr);
+
+	switch_mutex_lock(rtp_session->ice_mutex);
+
+	if (ice->ice_params && (i = switch_rtp_ice_find_candidate(ice, host, &port)) >= 0) {
+		nominated = (1 == switch_rtp_ice_is_candidate_nominated(rtp_session, ice,
+								&ice->ice_params->cands[i][ice->proto],
+								i == ice->ice_params->chosen[ice->proto], NULL, 0));
+	}
+
+	switch_mutex_unlock(rtp_session->ice_mutex);
+
+	return nominated;
+}
+
 /* Phase 2 (media-driven selection, controlled + nomination + rtcp-mux): the read path
    only OBSERVES media - it records, per candidate, when authenticated RTP last arrived
    from it (media_rcv_last). It deliberately does NOT switch the send target here.
@@ -7296,8 +7349,17 @@ static switch_status_t read_rtp_packet(switch_rtp_t *rtp_session, switch_size_t 
 				/* got packet which seems to not belong to us, let's make more checks */
 				switch_rtp_inject_dos_packet_t *packet = NULL;
 
-				if ((rtp_session->has_rtp || rtp_session->has_rtcp) && !switch_rtp_test_flag(rtp_session, SWITCH_RTP_FLAG_AUTOADJ)) {
-					/* it's RTP or RTCP (rtcpmux) packet and we aren't in auto-adjustment window anymore. Ignore it! */
+				if ((rtp_session->has_rtp || rtp_session->has_rtcp) && !switch_rtp_test_flag(rtp_session, SWITCH_RTP_FLAG_AUTOADJ) &&
+					!rtp_from_nominated_ice_cand(rtp_session)) {
+						/**
+						* it's RTP or RTCP (rtcpmux) packet and we aren't in auto-adjustment window anymore,
+						* and it did not come from a nominated ICE candidate either. Ignore it!
+						*
+						* The nominated case falls through the remaining checks instead of jumping to
+						* done_inject_dos_checks: an accepted media packet still has to pass the regular
+						* read path, which is where rtp_from_addr and last_rtp_hdr are set and where
+						* switch_rtp_media_observe eventually records the new candidate.
+						**/
 					packet = rtp_session->has_rtp ? &rtp_session->inject_dos.rtp : &rtp_session->inject_dos.rtcp;
 					switch_rtp_inject_dos_check(rtp_session, packet, SWITCH_FALSE);
 					switch_rtp_inject_dos_wipe_recv_msg(rtp_session, bytes);
