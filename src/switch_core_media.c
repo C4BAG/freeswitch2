@@ -16309,6 +16309,8 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_write_frame(switch_core_sess
 	switch_status_t status = SWITCH_STATUS_FALSE;
 	switch_frame_t *enc_frame = NULL, *write_frame = frame;
 	unsigned int flag = 0, need_codec = 0, perfect = 0, do_bugs = 0, do_write = 0, do_resample = 0, ptime_mismatch = 0, pass_cng = 0, resample = 0;
+	unsigned int timeline_mismatch = 0;
+	uint32_t carry_ts = 0;
 	int did_write_resample = 0;
 
 	switch_assert(session != NULL);
@@ -16382,6 +16384,18 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_write_frame(switch_core_sess
 		if (session->write_impl.codec_id == frame->codec->implementation->codec_id ||
 			session->write_impl.microseconds_per_packet != frame->codec->implementation->microseconds_per_packet) {
 			ptime_mismatch = TRUE;
+
+			/* ptime_mismatch is set for any two implementations of the same codec, which is a
+			   proxy for "the ptime differs" and wrong whenever something else differs instead -
+			   Opus mono against Opus stereo is 20 ms on both sides. Downstream the flag decides
+			   two unrelated things: whether the buffered path is needed, which the proxy answers
+			   correctly, and whether the inbound timestamp can be carried over, which it does
+			   not. The timestamp is a sample index at the clock rate; only a different ptime or
+			   a different rate makes it unusable, and that is what this second flag says. */
+			if (session->write_impl.microseconds_per_packet != frame->codec->implementation->microseconds_per_packet ||
+				session->write_impl.actual_samples_per_second != frame->codec->implementation->actual_samples_per_second) {
+				timeline_mismatch = TRUE;
+			}
 
 			if ((switch_test_flag(frame->codec, SWITCH_CODEC_FLAG_PASSTHROUGH) || switch_test_flag(session->read_codec, SWITCH_CODEC_FLAG_PASSTHROUGH)) ||
 				switch_channel_test_flag(session->channel, CF_PASSTHRU_PTIME_MISMATCH)) {
@@ -16756,6 +16770,20 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_write_frame(switch_core_sess
 				switch_core_media_bug_flush_all(session);
 			}
 
+			/* Whether the inbound timestamp may be carried to what comes out of the buffer below.
+			   It may only when this one write lines up with exactly one outgoing packet, and that
+			   is a thing to test rather than to assume: the buffer has to be empty on entry, and
+			   the frame has to be exactly one packet. A remainder left by an earlier call, or a
+			   frame that is not one packet - the decoder can return NOOP, which hands on the
+			   inbound frame and skips the channel mux above - would make the drain loop run a
+			   number of times that has no relation to the frames that went in, and every
+			   timestamp derived from this one would be wrong. In those cases the wall clock takes
+			   over, exactly as it did before. */
+			carry_ts = (!timeline_mismatch && !resample && frame->timestamp &&
+						switch_buffer_inuse(session->raw_write_buffer) == 0 &&
+						write_frame->datalen == session->write_impl.decoded_bytes_per_packet)
+				? (uint32_t) frame->timestamp : 0;
+
 			if (!(switch_buffer_write(session->raw_write_buffer, write_frame->data, write_frame->datalen))) {
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Write Buffer %u bytes Failed!\n", write_frame->datalen);
 				status = SWITCH_STATUS_MEMERR;
@@ -16778,7 +16806,17 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_write_frame(switch_core_sess
 				enc_frame = &session->raw_write_frame;
 				session->raw_write_frame.rate = session->write_impl.actual_samples_per_second;
 				session->enc_write_frame.datalen = session->enc_write_frame.buflen;
-				session->enc_write_frame.timestamp = 0;
+
+				/* This used to drop the inbound timestamp unconditionally. Where carry_ts says the
+				   write lined up with one packet, keeping it anchors the outgoing timeline to the
+				   media instead of to the wall clock, which is what stops a writer that falls
+				   behind from turning the shortfall into permanent one-way delay further down in
+				   get_next_write_ts. carry_ts is cleared after the first pass: by its own
+				   precondition there is no second one, and if there were, this frame's timestamp
+				   would not describe it. Both frames are stamped because the encoder may return
+				   NOOP, in which case raw_write_frame is what goes out. */
+				session->enc_write_frame.timestamp = session->raw_write_frame.timestamp = carry_ts;
+				carry_ts = 0;
 
 
 				if (frame->codec && frame->codec->implementation && switch_core_codec_ready(frame->codec)) {
@@ -16906,7 +16944,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_write_frame(switch_core_sess
 					switch_set_flag(write_frame, SFF_CNG);
 				}
 
-				if (ptime_mismatch || resample) {
+				if (timeline_mismatch || resample) {
 					write_frame->timestamp = 0;
 				}
 
@@ -16926,7 +16964,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_write_frame(switch_core_sess
 
   done:
 
-	if (ptime_mismatch || resample) {
+	if (timeline_mismatch || resample) {
 		write_frame->timestamp = 0;
 	}
 
