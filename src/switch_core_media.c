@@ -214,6 +214,10 @@ struct switch_rtp_engine_s {
 #define MAX_REJ_STREAMS 10
 
 struct switch_media_handle_s {
+	/* Writes lost to lock contention, see note_write_drop_busy. */
+	uint32_t wdrop_busy;
+	switch_time_t wdrop_last_log;
+
 	switch_core_session_t *session;
 	switch_channel_t *channel;
 	switch_core_media_flag_t media_flags[SCMF_MAX];
@@ -16302,6 +16306,34 @@ SWITCH_DECLARE(switch_msrp_session_t *) switch_core_media_get_msrp_session(switc
 }
 
 
+/* A write that was thrown away because another thread held codec_write_mutex. The path
+   returns SWITCH_STATUS_SUCCESS and says nothing, so the loss is invisible upstream; unlike
+   the hold, pause and rejected-CNG paths beside it, it is not an intended discard but lock
+   contention, and media the peer should have had. Rate limited; the counter is written
+   without a lock, which can lose a count but not mislead - this is the contended case by
+   definition. */
+static void note_write_drop_busy(switch_core_session_t *session)
+{
+	switch_media_handle_t *mh;
+	switch_time_t now;
+
+	if (!session || !(mh = session->media_handle)) {
+		return;
+	}
+
+	mh->wdrop_busy++;
+
+	now = switch_micro_time_now();
+	if (now - mh->wdrop_last_log < 10000000) {
+		return;
+	}
+	mh->wdrop_last_log = now;
+
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+					  "Write frames dropped: %u so far, codec_write_mutex held by another thread. "
+					  "Each one is media the peer never gets.\n", mh->wdrop_busy);
+}
+
 SWITCH_DECLARE(switch_status_t) switch_core_session_write_frame(switch_core_session_t *session, switch_frame_t *frame, switch_io_flag_t flags,
 																int stream_id)
 {
@@ -16323,6 +16355,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_write_frame(switch_core_sess
 	if (switch_mutex_trylock(session->codec_write_mutex) == SWITCH_STATUS_SUCCESS) {
 		switch_mutex_unlock(session->codec_write_mutex);
 	} else {
+		note_write_drop_busy(session);
 		return SWITCH_STATUS_SUCCESS;
 	}
 
