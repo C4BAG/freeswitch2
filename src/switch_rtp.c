@@ -547,6 +547,12 @@ struct switch_rtp {
 	switch_time_t last_adj;
 	switch_time_t adj_window;
 	switch_time_t last_ice_cand_drop_log;   /* rate limit for the "media dropped from a known ICE candidate" warning */
+	switch_time_t age_t0;                   /* reference point for the outgoing timeline age, see get_next_write_ts */
+	uint32_t age_ts0;
+	uint32_t age_rate;
+	switch_time_t age_last_call;
+	int32_t age_ms_max;
+	switch_time_t last_age_log;
 	uint32_t elapsed_stun;
 	uint32_t elapsed_media;
 	uint32_t elapsed_adj;
@@ -2236,6 +2242,13 @@ SWITCH_DECLARE(void) switch_rtp_init(switch_memory_pool_t *pool)
 	global_init = 1;
 }
 
+/* How often to report how far the outgoing timeline lags real time, and from which lag
+   that report is a warning rather than a note. A pause longer than AGE_IDLE_RESEAT between
+   two writes is not latency - nobody was writing - so the reference is taken again. */
+#define AGE_LOG_INTERVAL 2000000
+#define AGE_WARN_MS 200
+#define AGE_IDLE_RESEAT 1000000
+
 static uint8_t get_next_write_ts(switch_rtp_t *rtp_session, uint32_t timestamp)
 {
 	uint8_t m = 0, changed = 0;
@@ -2259,6 +2272,60 @@ static uint8_t get_next_write_ts(switch_rtp_t *rtp_session, uint32_t timestamp)
 			&& !(rtp_session->rtp_bugs & RTP_BUG_NEVER_SEND_MARKER)) {
 			m++;
 		}
+	}
+
+	/* How far the outgoing timeline has fallen behind real time, which is the one number that
+	   says whether this leg is building up latency. The media clock and the wall clock have no
+	   common origin, so a reference is taken and everything after is measured against it: a flat
+	   value means the leg is keeping pace, a rising one means media is going out later and later
+	   than it came in. Nothing else in the log reports that.
+
+	   The reference is taken again whenever it would otherwise lie: after a pause in writing
+	   (hold, a parked leg, a source that stopped - the time nobody was writing is not latency),
+	   after a clock rate change from a re-INVITE, and after a step too large to be a delay,
+	   which means the far end renumbered its timestamps. A delay already present at the
+	   reference is invisible here; only the two legs together could show that.
+
+	   Audio only: video and text sessions run a samples_per_second far below 1000, which the
+	   guard excludes - it is also what keeps the division safe. The fields are read and written
+	   without a lock and the RTCP path can reach this function from the read thread; the cost of
+	   a race is a duplicated or missing log line, which is not worth a lock on this path. */
+	if (rtp_session->samples_per_second >= 1000) {
+		switch_time_t now = switch_micro_time_now();
+
+		if (!rtp_session->age_t0 ||
+			rtp_session->age_rate != rtp_session->samples_per_second ||
+			(rtp_session->age_last_call && now - rtp_session->age_last_call > AGE_IDLE_RESEAT)) {
+			rtp_session->age_t0 = now;
+			rtp_session->age_ts0 = rtp_session->ts;
+			rtp_session->age_rate = rtp_session->samples_per_second;
+			rtp_session->age_ms_max = 0;
+		} else {
+			int32_t wall_ms = (int32_t) ((now - rtp_session->age_t0) / 1000);
+			int32_t media_ms = (int32_t) (rtp_session->ts - rtp_session->age_ts0) / (int32_t) (rtp_session->age_rate / 1000);
+			int32_t age = wall_ms - media_ms;
+
+			if (age < -2000 || age > 120000) {
+				rtp_session->age_t0 = now;
+				rtp_session->age_ts0 = rtp_session->ts;
+				rtp_session->age_ms_max = 0;
+			} else {
+				if (age > rtp_session->age_ms_max) {
+					rtp_session->age_ms_max = age;
+				}
+
+				if (now - rtp_session->last_age_log >= AGE_LOG_INTERVAL) {
+					rtp_session->last_age_log = now;
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session),
+									  age >= AGE_WARN_MS ? SWITCH_LOG_WARNING : SWITCH_LOG_DEBUG,
+									  "RTP outgoing timeline age: %s %d ms behind real time, %d ms at worst "
+									  "since the last reference point.\n",
+									  rtp_type(rtp_session), age, rtp_session->age_ms_max);
+				}
+			}
+		}
+
+		rtp_session->age_last_call = now;
 	}
 
 	return m;
