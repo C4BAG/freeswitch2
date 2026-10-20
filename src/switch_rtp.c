@@ -9032,6 +9032,23 @@ static int rtp_common_read(switch_rtp_t *rtp_session, switch_payload_t *payload_
 		if (!rtp_session->flags[SWITCH_RTP_FLAG_USE_TIMER] && rtp_session->read_pollfd) {
 			int pt = poll_sec * 1000000;
 
+			/* Without a timer this poll is also how often the thread gets to look at
+			   SWITCH_RTP_FLAG_BREAK, which signalling sets to interrupt a read in progress:
+			   the flag is tested once per pass of this loop, after the poll returns. A
+			   re-INVITE that arrives while the peer has stopped sending media - a peer
+			   reswitching ICE candidates does exactly that - then waits out the whole
+			   timeout before the channel thread reacts, and five seconds is far longer than
+			   any SIP peer is willing to wait. One packet interval is what the DTMF case
+			   below already uses, and it is what the timer itself would give.
+
+			   Arriving media returns the poll at once, so this changes nothing while a call
+			   is talking; it shortens the idle wait, and the price is that an idle channel
+			   wakes as often as it would with a timer. */
+			if (!rtp_session->flags[SWITCH_RTP_FLAG_VIDEO] && !rtp_session->flags[SWITCH_RTP_FLAG_UDPTL] &&
+				rtp_session->ms_per_packet && rtp_session->ms_per_packet < (uint32_t) pt) {
+				pt = (int) rtp_session->ms_per_packet;
+			}
+
 			do_2833(rtp_session);
 
 			if (rtp_session->dtmf_data.out_digit_dur > 0 || rtp_session->dtmf_data.in_digit_sanity || rtp_session->sending_dtmf ||
