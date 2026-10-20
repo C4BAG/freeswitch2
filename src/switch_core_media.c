@@ -5493,6 +5493,7 @@ SWITCH_DECLARE(uint8_t) switch_core_media_negotiate_sdp(switch_core_session_t *s
 		} else if (m->m_type == sdp_media_audio && m->m_port && !got_audio) {
 			sdp_rtpmap_t *map;
 			int ice = 0;
+			int m_ice = 0, m_cand = 0, trickle_offer = 0;
 
 			nm_idx = 0;
 			m_idx = 0;
@@ -5508,8 +5509,32 @@ SWITCH_DECLARE(uint8_t) switch_core_media_negotiate_sdp(switch_core_session_t *s
 				}
 			}
 
+			/* An offer whose ICE candidates are still to come is written exactly like a hold of
+			   RFC 2543: m=audio 9 with c=IN IP4 0.0.0.0. It means the opposite - the candidates
+			   follow - and holding such a call is a hold the peer never asked for, so no unhold
+			   ever comes to end it. What separates the two is ICE without a single candidate
+			   line, which is the test check_ice() makes further down as trickle_no_cand. An
+			   offer that carries candidates and still nulls the address is left as a hold, and
+			   so is one that says sendonly or inactive, which is handled above. */
+			for (attr = m->m_attributes; attr; attr = attr->a_next) {
+				if (zstr(attr->a_name)) {
+					continue;
+				}
+				if (!strncasecmp(attr->a_name, "ice", 3)) {
+					m_ice = 1;
+				} else if (!strcasecmp(attr->a_name, "candidate")) {
+					m_cand = 1;
+				}
+			}
+			trickle_offer = (m_ice && !m_cand);
+
 			if (!sendonly && m->m_connections && m->m_connections->c_address && !strcmp(m->m_connections->c_address, "0.0.0.0")) {
-				sendonly = 1;
+				if (trickle_offer) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+									  "Trickle ICE offer with no candidates yet: c=0.0.0.0 is not a hold here\n");
+				} else {
+					sendonly = 1;
+				}
 			}
 
 
