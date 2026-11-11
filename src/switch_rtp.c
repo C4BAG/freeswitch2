@@ -551,6 +551,7 @@ struct switch_rtp {
 	uint32_t age_ts0;
 	uint32_t age_rate;
 	switch_time_t age_last_call;
+	uint32_t age_last_ts;
 	int32_t age_ms_max;
 	switch_time_t last_age_log;
 	uint32_t elapsed_stun;
@@ -2247,7 +2248,8 @@ SWITCH_DECLARE(void) switch_rtp_init(switch_memory_pool_t *pool)
    two writes is not latency - nobody was writing - so the reference is taken again. */
 #define AGE_LOG_INTERVAL 2000000
 #define AGE_WARN_MS 200
-#define AGE_IDLE_RESEAT 1000000
+#define AGE_STEP_SLACK 500
+#define AGE_MAX_LIFE 600000000
 
 static uint8_t get_next_write_ts(switch_rtp_t *rtp_session, uint32_t timestamp)
 {
@@ -2273,61 +2275,6 @@ static uint8_t get_next_write_ts(switch_rtp_t *rtp_session, uint32_t timestamp)
 			m++;
 		}
 	}
-
-	/* How far the outgoing timeline has fallen behind real time, which is the one number that
-	   says whether this leg is building up latency. The media clock and the wall clock have no
-	   common origin, so a reference is taken and everything after is measured against it: a flat
-	   value means the leg is keeping pace, a rising one means media is going out later and later
-	   than it came in. Nothing else in the log reports that.
-
-	   The reference is taken again whenever it would otherwise lie: after a pause in writing
-	   (hold, a parked leg, a source that stopped - the time nobody was writing is not latency),
-	   after a clock rate change from a re-INVITE, and after a step too large to be a delay,
-	   which means the far end renumbered its timestamps. A delay already present at the
-	   reference is invisible here; only the two legs together could show that.
-
-	   Audio only: video and text sessions run a samples_per_second far below 1000, which the
-	   guard excludes - it is also what keeps the division safe. The fields are read and written
-	   without a lock and the RTCP path can reach this function from the read thread; the cost of
-	   a race is a duplicated or missing log line, which is not worth a lock on this path. */
-	if (rtp_session->samples_per_second >= 1000) {
-		switch_time_t now = switch_micro_time_now();
-
-		if (!rtp_session->age_t0 ||
-			rtp_session->age_rate != rtp_session->samples_per_second ||
-			(rtp_session->age_last_call && now - rtp_session->age_last_call > AGE_IDLE_RESEAT)) {
-			rtp_session->age_t0 = now;
-			rtp_session->age_ts0 = rtp_session->ts;
-			rtp_session->age_rate = rtp_session->samples_per_second;
-			rtp_session->age_ms_max = 0;
-		} else {
-			int32_t wall_ms = (int32_t) ((now - rtp_session->age_t0) / 1000);
-			int32_t media_ms = (int32_t) (rtp_session->ts - rtp_session->age_ts0) / (int32_t) (rtp_session->age_rate / 1000);
-			int32_t age = wall_ms - media_ms;
-
-			if (age < -2000 || age > 120000) {
-				rtp_session->age_t0 = now;
-				rtp_session->age_ts0 = rtp_session->ts;
-				rtp_session->age_ms_max = 0;
-			} else {
-				if (age > rtp_session->age_ms_max) {
-					rtp_session->age_ms_max = age;
-				}
-
-				if (now - rtp_session->last_age_log >= AGE_LOG_INTERVAL) {
-					rtp_session->last_age_log = now;
-					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session),
-									  age >= AGE_WARN_MS ? SWITCH_LOG_WARNING : SWITCH_LOG_DEBUG,
-									  "RTP outgoing timeline age: %s %d ms behind real time, %d ms at worst "
-									  "since the last reference point.\n",
-									  rtp_type(rtp_session), age, rtp_session->age_ms_max);
-				}
-			}
-		}
-
-		rtp_session->age_last_call = now;
-	}
-
 	return m;
 }
 
@@ -9980,6 +9927,91 @@ static int rtp_write_ready(switch_rtp_t *rtp_session, uint32_t bytes, int line)
 }
 
 
+/* How far the outgoing timeline has fallen behind real time, which is the one number that
+   says whether this leg is building up latency. The media clock and the wall clock have no
+   common origin, so a reference is taken and everything after is measured against it: a flat
+   value means the leg is keeping pace, a rising one means media is going out later and later
+   than it came in. Nothing else in the log reports that.
+
+   Called from rtp_common_write with the timestamp as it goes on the wire, for packets that
+   are actually sent, so it covers every way one is arrived at - carried from the peer, taken
+   from the write timer, or carried forward one interval at a time. It used to sit inside
+   get_next_write_ts, which a passed-through packet never reaches, and that is most of them
+   whenever both legs speak one codec: in the field a whole call then produced not one line,
+   and an echo test whose delay grew to 2239 ms was measured as zero throughout.
+
+   The reference is taken again when it would otherwise lie, and what decides that is whether
+   the media clock kept step with the wall clock since the last packet, not how long the wait
+   was. A peer that stops sending for a second still counts its timestamps through the pause,
+   and so does the write timer, so neither needs a new reference; a leg coming back from hold
+   with the timestamp where it left off, or a source that was swapped underneath, does. One
+   test covers both, and the slack is wide enough that jitter and the lag being measured -
+   which builds up over many packets, not in one step - never trip it.
+
+   A reference also retires after AGE_MAX_LIFE. Under passthrough the age is the distance
+   between the PEER's sample clock and our wall clock, and the two drift: at 100 ppm that is
+   6 ms a minute, so a reference left to live would cross AGE_WARN_MS on quartz alone. Ten
+   minutes keeps drift near 60 ms and is long enough to watch a lag grow.
+
+   Audio only: video and text run a samples_per_second far below 1000, which the guard
+   excludes - it is also what keeps the division safe. RFC2833 is skipped because its packets
+   repeat one timestamp by design, and a relayed digit would otherwise read as lag. The fields
+   are read and written without a lock and the RTCP path can reach rtp_common_write from the
+   read thread; the cost of a race is a duplicated or missing log line, which is not worth a
+   lock on this path. */
+static void note_timeline_age(switch_rtp_t *rtp_session, uint32_t ts, switch_payload_t pt)
+{
+	switch_time_t now;
+	int reseat;
+
+	if (rtp_session->samples_per_second < 1000 || (rtp_session->te != INVALID_PT && pt == rtp_session->te)) {
+		return;
+	}
+
+	now = switch_micro_time_now();
+
+	reseat = (!rtp_session->age_t0 ||
+			  rtp_session->age_rate != rtp_session->samples_per_second ||
+			  now - rtp_session->age_t0 > AGE_MAX_LIFE);
+
+	if (!reseat && rtp_session->age_last_call) {
+		int32_t step_wall = (int32_t) ((now - rtp_session->age_last_call) / 1000);
+		int32_t step_media = (int32_t) (ts - rtp_session->age_last_ts) / (int32_t) (rtp_session->age_rate / 1000);
+
+		if (abs(step_wall - step_media) > AGE_STEP_SLACK) {
+			reseat = 1;
+		}
+	}
+
+	if (reseat) {
+		rtp_session->age_t0 = now;
+		rtp_session->age_ts0 = ts;
+		rtp_session->age_rate = rtp_session->samples_per_second;
+		rtp_session->age_ms_max = 0;
+		rtp_session->last_age_log = now;
+	} else {
+		int32_t wall_ms = (int32_t) ((now - rtp_session->age_t0) / 1000);
+		int32_t media_ms = (int32_t) (ts - rtp_session->age_ts0) / (int32_t) (rtp_session->age_rate / 1000);
+		int32_t age = wall_ms - media_ms;
+
+		if (age > rtp_session->age_ms_max) {
+			rtp_session->age_ms_max = age;
+		}
+
+		if (now - rtp_session->last_age_log >= AGE_LOG_INTERVAL) {
+			rtp_session->last_age_log = now;
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(rtp_session->session),
+							  age >= AGE_WARN_MS ? SWITCH_LOG_WARNING : SWITCH_LOG_DEBUG,
+							  "RTP outgoing timeline age: %s %d ms behind real time, %d ms at worst "
+							  "since the last reference point.\n",
+							  rtp_type(rtp_session), age, rtp_session->age_ms_max);
+		}
+	}
+
+	rtp_session->age_last_call = now;
+	rtp_session->age_last_ts = ts;
+}
+
 static int rtp_common_write(switch_rtp_t *rtp_session,
 							rtp_msg_t *send_msg, void *data, uint32_t datalen, switch_payload_t payload, uint32_t timestamp, switch_frame_flag_t *flags)
 {
@@ -10292,6 +10324,8 @@ static int rtp_common_write(switch_rtp_t *rtp_session,
 	}
 
 	if (send) {
+		note_timeline_age(rtp_session, this_ts, send_msg->header.pt);
+
 		int delta = 1;
 
 		if (rtp_session->flags[SWITCH_RTP_FLAG_VIDEO] && (*flags & SFF_EXTERNAL) && 
